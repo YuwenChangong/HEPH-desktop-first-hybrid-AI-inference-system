@@ -1,0 +1,49 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HEPH</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            appbg: "#0b0d10",
+            panel: "#101317",
+            line: "#1f242d",
+            muted: "#8f99a8",
+          },
+        },
+      },
+    };
+  </script>
+  <script>
+    // Set these two values before first login (or inject from your own config pipeline).
+    window.__SUPABASE_URL = "https://YOUR_PROJECT.supabase.co";
+    window.__SUPABASE_ANON_KEY = "YOUR_PUBLIC_SUPABASE_ANON_KEY";
+  </script>
+  <link rel="stylesheet" href="./styles.css?v=20260423ui3" />
+  <link rel="stylesheet" href="./theme-cream.css?v=20260423ui3" />
+</head>
+<body class="bg-appbg text-zinc-100 antialiased">
+  <div id="app"></div>
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel" data-presets="env,react" src="./app.js?v=20260423e"></script>
+  <script>
+    window.addEventListener("error", function () {
+      if (!window.React || !window.ReactDOM) {
+        var app = document.getElementById("app");
+        if (app) {
+          app.innerHTML =
+            '<div style="padding:24px;color:#e4e4e7;font-family:Segoe UI,Microsoft YaHei,sans-serif;">依赖加载失败：请检查网络是否可以访问 jsDelivr CDN，或者告诉我，我给你改成本地离线可运行版本。</div>';
+        }
+      }
+    });
+  </script>
+</body>
+</html>

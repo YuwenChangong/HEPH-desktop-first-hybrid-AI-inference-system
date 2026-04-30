@@ -1,0 +1,114 @@
+{
+  "name": "heph-desktop",
+  "version": "1.0.0",
+  "author": "HEPH",
+  "private": true,
+  "description": "Desktop shell for HEPH",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "powershell -ExecutionPolicy Bypass -File build\\prepare-runtime.ps1 && electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.heph.desktop",
+    "productName": "HEPH",
+    "asar": true,
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js"
+    ],
+    "extraResources": [
+      {
+          "from": "build/runtime-staged-release/ollama",
+        "to": "runtime/ollama",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/*.log"
+        ]
+      },
+      {
+          "from": "build/runtime-staged-release/ops",
+        "to": "runtime/ops",
+        "filter": [
+          "**/*",
+          "!logs{,/**}",
+          "!runtime{,/**}",
+          "!GO_LIVE_CHECKLIST.md"
+        ]
+      },
+      {
+          "from": "build/runtime-staged-release/v12_gateway",
+        "to": "runtime/v12_gateway",
+        "filter": [
+          "api/index.pyc"
+        ]
+      },
+      {
+          "from": "build/runtime-staged-release/app-frontend",
+        "to": "runtime/app-frontend",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+          "from": "build/runtime-staged-release/miner",
+        "to": "runtime/miner",
+        "filter": [
+          "heph.pyc"
+        ]
+      },
+      {
+          "from": "build/runtime-staged-release/.venv",
+        "to": "runtime/.venv",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/pip-cache{,/**}"
+        ]
+      },
+      {
+          "from": "build/runtime-staged-release/config-templates",
+        "to": "runtime/config-templates"
+      }
+    ],
+    "extraFiles": [
+      {
+        "from": "uninstall-app.ps1",
+        "to": "uninstall-app.ps1"
+      }
+    ],
+    "win": {
+      "icon": "build/heph-logo.png",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "multiLanguageInstaller": true,
+      "displayLanguageSelector": false,
+      "installerIcon": "build/heph-logo.ico",
+      "uninstallerIcon": "build/heph-logo.ico",
+      "installerHeaderIcon": "build/heph-logo.ico",
+      "installerLanguages": [
+        "en_US",
+        "zh_CN",
+        "ja_JP",
+        "fr_FR"
+      ],
+      "include": "build/installer-lang.nsh"
+    }
+  }
+}

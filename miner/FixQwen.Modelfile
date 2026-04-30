@@ -1,0 +1,13 @@
+FROM qwen3.5:9b
+
+# 恢复官方对话模板，防止它进入“乱思考”模式
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ .Response }}<|im_end|>"""
+
+# 明确指定停止词，防止模型没完没了地写“心理活动”
+PARAMETER stop "<|im_start|>"
+PARAMETER stop "<|im_end|>"

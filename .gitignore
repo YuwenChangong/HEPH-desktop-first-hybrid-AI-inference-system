@@ -1,0 +1,57 @@
+.DS_Store
+Thumbs.db
+*.log
+*.pid
+*.tmp
+*.bak
+
+# Secrets and local env
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.sample
+
+# Python
+.venv/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+*.sqlite3
+
+# Editors / IDE
+.idea/
+**/.idea/
+.vscode/
+**/.vscode/
+
+# Temporary build/parser folders
+.tmp_parser/
+public-repo-export/
+open-source-core*/
+
+# Frontend / desktop local dependencies and outputs
+desktop/node_modules/
+desktop/dist/
+desktop/dist-installer-test/
+desktop/build/runtime-staged/
+desktop/build/runtime-staged-release/
+desktop/build/runtime-staged-safe/
+desktop/build/builder-effective-config.yaml
+desktop/build/builder-debug.yml
+desktop/win-unpacked/
+desktop/*.exe
+desktop/**/*.exe
+desktop/**/*.zip
+desktop/**/*.7z
+
+# Runtime / generated folders
+**/runtime/
+**/logs/
+**/*.out.log
+**/*.err.log
+
+# Local model/runtime caches
+ollama/models/
+ollama/cache/
