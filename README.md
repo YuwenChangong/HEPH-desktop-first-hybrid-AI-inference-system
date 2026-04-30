@@ -10,7 +10,7 @@ It combines three execution paths in one product:
 - `Remote` for worker-node-backed execution
 - `Auto` for capability-aware routing between the two
 
-The result is a chat and task experience that feels local when possible, but can expand into a distributed execution network when needed.
+The result is a chat and task experience that stays close to the machine when possible, but can expand into a distributed execution network when more capacity is needed.
 
 ## Why HEPH
 
@@ -23,7 +23,7 @@ HEPH is built around a different model:
 - let remote worker nodes extend capacity instead of replacing the client
 - keep routing, task state, and worker-node flow understandable in code
 
-If you are interested in desktop AI products, hybrid inference, or distributed task execution, this repository shows the core shape of that system.
+If you are interested in desktop AI products, hybrid inference, or distributed task execution, this repository shows the core shape of that system in code.
 
 ## Core concepts
 
@@ -54,17 +54,17 @@ Choose between local and remote depending on local capability, model availabilit
 
 Use this repository to:
 
-- inspect the desktop architecture
+- inspect a desktop-first AI product architecture
 - review the client and worker-node workflow
 - understand the local / auto / remote routing model
 - contribute product, UX, or implementation improvements
-- explore a desktop-first approach to distributed AI inference
+- study a practical hybrid inference design instead of a cloud-only stack
 
 ## Development notes
 
-This repository is meant to be readable and portable.
+This repository is meant to be readable, portable, and easy to inspect.
 
-Some environment-specific and deployment-specific pieces are intentionally not part of the public tree, so treat this repository as the public core rather than a mirror of every internal workspace detail.
+It focuses on the public core of HEPH: desktop flow, routing logic, frontend behavior, and worker-node execution. If you are reading the code to understand the product shape, the important paths are all here.
 
 For contribution rules and release boundaries, see [CONTRIBUTING.md](CONTRIBUTING.md), [PUBLIC_REPO_GUIDE.md](PUBLIC_REPO_GUIDE.md), and [SECURITY.md](SECURITY.md).
 
