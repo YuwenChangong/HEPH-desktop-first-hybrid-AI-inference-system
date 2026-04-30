@@ -1,4 +1,4 @@
-﻿import os
+import os
 import time
 import logging
 import re
@@ -52,10 +52,10 @@ def sanitize_log_text(text):
         (r"Bearer\s+[A-Za-z0-9\-\._~\+/=]+", "Bearer [redacted]"),
         (r"(access_token['\"=:\s]+)[^,\s\}\]]+", r"\1[redacted]"),
         (r"(refresh_token['\"=:\s]+)[^,\s\}\]]+", r"\1[redacted]"),
-        (r"(SUPABASE_KEY=
-        (r"(ADMIN_CREDIT_GRANT_KEY=
-        (r"(AUTH_SECRET=
-        (r"(AUTH_JWT_SECRET=
+        (r"(SUPABASE_KEY=)[^\s]+", r"\1[redacted]"),
+        (r"(ADMIN_CREDIT_GRANT_KEY=)[^\s]+", r"\1[redacted]"),
+        (r"(AUTH_SECRET=)[^\s]+", r"\1[redacted]"),
+        (r"(AUTH_JWT_SECRET=)[^\s]+", r"\1[redacted]"),
         (r"https://[A-Za-z0-9\-]+\.supabase\.co", "https://[supabase-host]"),
         (r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b", "[uuid]"),
         (r"(miner_name[='\":\s]+)([A-Za-z0-9._:-]+)", r"\1[miner]"),
@@ -135,6 +135,10 @@ def enforce_daily_task_create_limit(user_id: str):
 
 URL = os.environ.get("SUPABASE_URL")
 KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+SUPABASE_VERIFY_KEY = SUPABASE_ANON_KEY or KEY
+CONTROL_PLANE_BASE_URL = str(os.environ.get("CONTROL_PLANE_BASE_URL") or "").strip().rstrip("/")
+CONTROL_PLANE_TIMEOUT_SECONDS = float(os.environ.get("CONTROL_PLANE_TIMEOUT_SECONDS", "30"))
 TASK_LEASE_TIMEOUT_SECONDS = int(os.environ.get("TASK_LEASE_TIMEOUT_SECONDS", "1200"))
 STALE_RECOVERY_INTERVAL_SECONDS = int(os.environ.get("STALE_RECOVERY_INTERVAL_SECONDS", "15"))
 LOCAL_MINER_PROFILE_URL = os.environ.get("LOCAL_MINER_PROFILE_URL", "http://127.0.0.1:8765/miner-profile")
@@ -152,12 +156,14 @@ LOCAL_HISTORY_MESSAGES = int(os.environ.get("LOCAL_HISTORY_MESSAGES", "3"))
 LOCAL_HISTORY_CONTENT_CHARS = int(os.environ.get("LOCAL_HISTORY_CONTENT_CHARS", "300"))
 LOCAL_NORMAL_NUM_PREDICT = int(os.environ.get("LOCAL_NORMAL_NUM_PREDICT", "2048"))
 LOCAL_DEEP_NUM_PREDICT = int(os.environ.get("LOCAL_DEEP_NUM_PREDICT", "1200"))
+LOCAL_OLLAMA_NUM_CTX = int(os.environ.get("LOCAL_OLLAMA_NUM_CTX", "2048"))
+LOCAL_OLLAMA_NUM_BATCH = int(os.environ.get("LOCAL_OLLAMA_NUM_BATCH", "32"))
 OLLAMA_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}(:[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$")
 AUTH_TOKEN_TTL_SECONDS = int(os.environ.get("AUTH_TOKEN_TTL_SECONDS", str(60 * 60 * 24 * 30)))
 DEFAULT_USER_CREDITS = float(os.environ.get("DEFAULT_USER_CREDITS", "0.0"))
 MESSAGE_CREDIT_COST = float(os.environ.get("MESSAGE_CREDIT_COST", "0.1"))
 MINER_REWARD_CREDIT = float(os.environ.get("MINER_REWARD_CREDIT", "0.1"))
-ADMIN_CREDIT_GRANT_KEY = 
+ADMIN_CREDIT_GRANT_KEY = str(os.environ.get("ADMIN_CREDIT_GRANT_KEY") or "").strip()
 
 DEFAULT_MODELS = ["qwen3.5:2b", "qwen3.5:9b", "qwen3.5:27b"]
 
@@ -187,6 +193,8 @@ _http_path_counters = defaultdict(int)
 _task_stream_queues = {}  # task_id -> asyncio.Queue
 _task_stream_lock = threading.Lock()
 _task_stream_ttl_seconds = 600  # Keep streams for 10 minutes after completion
+_local_task_records = {}
+_local_task_lock = threading.Lock()
 SUPABASE_RETRY_ATTEMPTS = int(os.environ.get("SUPABASE_RETRY_ATTEMPTS", "3"))
 SUPABASE_RETRY_BASE_DELAY_SECONDS = float(os.environ.get("SUPABASE_RETRY_BASE_DELAY_SECONDS", "0.25"))
 
@@ -195,8 +203,8 @@ if not URL or not KEY:
 else:
     supabase = create_client(URL, KEY)
 
-AUTH_SECRET = 
-MINER_API_KEY = 
+AUTH_SECRET = os.environ.get("AUTH_SECRET") or hashlib.sha256(str(KEY or "dev-secret").encode("utf-8")).hexdigest()
+MINER_API_KEY = str(os.environ.get("MINER_API_KEY") or "").strip()
 SUPABASE_AUTH_TIMEOUT_SECONDS = int(os.environ.get("SUPABASE_AUTH_TIMEOUT_SECONDS", "10"))
 ALLOW_LEGACY_AUTH_SESSION = str(os.environ.get("ALLOW_LEGACY_AUTH_SESSION", "0")).lower() in ("1", "true", "yes", "on")
 
@@ -210,6 +218,55 @@ def error_response(code: str, message: str, **extra):
 def internal_error(endpoint: str, exc: Exception):
     logger.exception("Unhandled error at %s", endpoint)
     return error_response("internal_error", "Internal server error")
+
+
+def has_control_plane_proxy() -> bool:
+    return bool(CONTROL_PLANE_BASE_URL)
+
+
+def build_default_credit_summary(user_id: str):
+    normalized_uid = normalize_user_id_for_storage(user_id)
+    return {
+        "user_id": normalized_uid,
+        "total": DEFAULT_USER_CREDITS,
+        "spent": 0.0,
+        "reserved": 0.0,
+        "available": DEFAULT_USER_CREDITS,
+        "tasks": {"completed": 0, "failed": 0, "cancelled": 0, "active": 0},
+    }
+
+
+def proxy_control_plane_json(request: Request, path: str, method: str = "GET", json_body=None, params=None):
+    if not has_control_plane_proxy():
+        return error_response("service_unavailable", "Control plane unavailable")
+    try:
+        target = f"{CONTROL_PLANE_BASE_URL}{path}"
+        headers = {}
+        auth_header = str(request.headers.get("authorization") or "").strip()
+        if auth_header:
+            headers["Authorization"] = auth_header
+        request_id = str(getattr(request.state, "request_id", "") or request.headers.get("x-request-id") or "")
+        if request_id:
+            headers["x-request-id"] = request_id
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+        response = requests.request(
+            method.upper(),
+            target,
+            headers=headers,
+            json=json_body,
+            params=params,
+            timeout=CONTROL_PLANE_TIMEOUT_SECONDS,
+        )
+        if not response.content:
+            return {"status": "error", "message": f"Empty control plane response: HTTP {response.status_code}", "code": "control_plane_error"}
+        try:
+            return response.json()
+        except Exception:
+            return error_response("control_plane_error", f"Invalid control plane response: HTTP {response.status_code}")
+    except Exception as e:
+        logger.warning("control plane proxy failed path=%s: %s", path, e)
+        return error_response("service_unavailable", "Control plane request failed")
 
 
 def get_client_ip(request: Request) -> str:
@@ -339,12 +396,12 @@ def require_auth_user_id(request: Request):
 
 def verify_supabase_access_token(access_token: str):
     token = str(access_token or "").strip()
-    if not token or not URL or not KEY:
+    if not token or not URL or not SUPABASE_VERIFY_KEY:
         return None
     try:
         resp = requests.get(
             f"{str(URL).rstrip('/')}/auth/v1/user",
-            headers={"apikey": KEY, "Authorization": f"Bearer {token}"},
+            headers={"apikey": SUPABASE_VERIFY_KEY, "Authorization": f"Bearer {token}"},
             timeout=SUPABASE_AUTH_TIMEOUT_SECONDS,
         )
         if resp.status_code != 200:
@@ -1044,12 +1101,30 @@ def build_local_prompt(prompt, context, deep_think):
 
 
 def update_local_task(task_id, payload, filters=None):
-    safe_update_with_fallback(
-        "tasks",
-        payload,
-        filters=filters or [{"op": "eq", "col": "id", "val": task_id}],
-        optional_drop_order=["result_delta", "completed_at", "claimed_at", "miner_name"],
-    )
+    if supabase:
+        safe_update_with_fallback(
+            "tasks",
+            payload,
+            filters=filters or [{"op": "eq", "col": "id", "val": task_id}],
+            optional_drop_order=["result_delta", "completed_at", "claimed_at", "miner_name"],
+        )
+        return
+    with _local_task_lock:
+        task = _local_task_records.get(task_id)
+        if not task:
+            return
+        task.update(payload or {})
+
+
+def create_local_task_record(row: dict):
+    with _local_task_lock:
+        _local_task_records[str(row.get("id"))] = dict(row or {})
+
+
+def get_local_task_record(task_id: str):
+    with _local_task_lock:
+        row = _local_task_records.get(str(task_id))
+        return dict(row) if isinstance(row, dict) else None
 
 
 def _notify_sse_clients(task_id: str, data: dict):
@@ -1105,14 +1180,12 @@ def run_local_ollama_task(task_id, prompt, model, deep_think, context):
         
         final_prompt = build_local_prompt(prompt, context, deep_think)
         
-        # Dynamic num_predict based on prompt length only (model-agnostic)
-        # Ensure num_predict is at least 2x prompt length for simple questions
         prompt_len = len(final_prompt)
-        base_num_predict = LOCAL_NORMAL_NUM_PREDICT if not deep_think else LOCAL_DEEP_NUM_PREDICT
-        min_num_predict = max(512, prompt_len * 2)
-        num_predict = min(base_num_predict, max(min_num_predict, 2048))
-        
-        print(f"[DEBUG] Model: {model}, deep_think: {deep_think}, prompt_len: {prompt_len}, num_predict: {num_predict}")
+        generation_options = get_local_ollama_generation_options(model, prompt_len, deep_think)
+        print(
+            f"[DEBUG] Model: {model}, deep_think: {deep_think}, prompt_len: {prompt_len}, "
+            f"options={generation_options}"
+        )
         full_result = ""
         last_flush = 0.0
         last_supabase_flush = 0.0
@@ -1123,10 +1196,7 @@ def run_local_ollama_task(task_id, prompt, model, deep_think, context):
                 "model": model,
                 "prompt": final_prompt,
                 "stream": True,
-                "options": {
-                    "temperature": 0.3,
-                    "num_predict": num_predict,
-                },
+                "options": generation_options,
             },
             stream=True,
             timeout=(5, LOCAL_OLLAMA_READ_TIMEOUT_SECONDS),
@@ -1615,6 +1685,11 @@ def try_recover_stale_tasks():
 
 def get_task_status(task_id, max_retries=3, retry_delay=0.1):
     """Get task status with retry logic to handle Supabase replication delays."""
+    if not supabase:
+        local_row = get_local_task_record(task_id)
+        if not local_row:
+            return None
+        return str(local_row.get("status") or "").lower() or None
     for attempt in range(max_retries):
         try:
             res = (
@@ -1912,6 +1987,37 @@ def get_model_capability_score(model_name):
     return 1  # Can run on <6GB VRAM (4b and below)
 
 
+def get_local_ollama_generation_options(model_name: str, prompt_len: int, deep_think: bool):
+    model_score = get_model_capability_score(model_name)
+    vram_gb = float(get_local_gpu_vram_gb() or 0)
+
+    base_num_predict = LOCAL_NORMAL_NUM_PREDICT if not deep_think else LOCAL_DEEP_NUM_PREDICT
+    min_num_predict = max(256, min(1024, prompt_len * 2))
+    num_predict = min(base_num_predict, max(min_num_predict, 512))
+
+    num_ctx = LOCAL_OLLAMA_NUM_CTX
+    num_batch = LOCAL_OLLAMA_NUM_BATCH
+
+    # 8GB-class GPUs can run 9b models, but 4096 context tends to spill into CPU/GPU
+    # mixed execution and causes unstable first-token latency. Keep local defaults tighter.
+    if model_score >= 2 and vram_gb and vram_gb <= 8.5:
+        num_ctx = min(num_ctx, 1536)
+        num_batch = min(num_batch, 16)
+    elif model_score >= 3 and vram_gb and vram_gb <= 12.5:
+        num_ctx = min(num_ctx, 1024)
+        num_batch = min(num_batch, 16)
+
+    if deep_think:
+        num_ctx = min(num_ctx, 2048)
+
+    return {
+        "temperature": 0.3,
+        "num_predict": max(256, int(num_predict)),
+        "num_ctx": max(512, int(num_ctx)),
+        "num_batch": max(1, int(num_batch)),
+    }
+
+
 def model_is_installed_for_miner(miner_row, model_name):
     installed = miner_row.get("installed_models") if isinstance(miner_row, dict) else []
     if not isinstance(installed, list):
@@ -2104,23 +2210,20 @@ async def create_auth_session(request: Request):
 
 @app.post("/auth/supabase/session")
 async def create_supabase_auth_session(request: Request):
-    supabase_user = verify_supabase_access_token(extract_auth_bearer(request))
+    access_token = extract_auth_bearer(request)
+    supabase_user = verify_supabase_access_token(access_token)
     if not supabase_user:
         return error_response("unauthorized", "Invalid Supabase session token")
 
     user_id = normalize_user_id_for_storage(supabase_user.get("id"))
-    token = issue_auth_token(user_id)
+    token = issue_auth_token(user_id) if supabase else access_token
     if supabase:
         credits = compute_user_credit_summary(user_id)
+    elif has_control_plane_proxy():
+        proxied = proxy_control_plane_json(request, "/credits/me", method="GET")
+        credits = proxied.get("credits") if isinstance(proxied, dict) and proxied.get("status") == "success" else build_default_credit_summary(user_id)
     else:
-        credits = {
-            "user_id": user_id,
-            "total": DEFAULT_USER_CREDITS,
-            "spent": 0.0,
-            "reserved": 0.0,
-            "available": DEFAULT_USER_CREDITS,
-            "tasks": {"completed": 0, "failed": 0, "cancelled": 0, "active": 0},
-        }
+        credits = build_default_credit_summary(user_id)
     return {
         "status": "success",
         "session": {"user_id": user_id, "token": token, "expires_in": AUTH_TOKEN_TTL_SECONDS},
@@ -2137,6 +2240,8 @@ async def create_supabase_auth_session(request: Request):
 @app.get("/credits/me")
 def credits_me(request: Request):
     if not supabase:
+        if has_control_plane_proxy():
+            return proxy_control_plane_json(request, "/credits/me", method="GET")
         return error_response("service_unavailable", "Supabase credentials missing")
     user_id, auth_error = require_auth_user_id(request)
     if auth_error:
@@ -2777,9 +2882,6 @@ async def claim_order_manually(request: Request):
 
 @app.post("/task")
 async def create_task(request: Request):
-    if not supabase:
-        return error_response("service_unavailable", "Supabase credentials missing")
-
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     allowed, retry_after = rate_limit_guard(request, "create_task", limit=40, window_seconds=60)
     if not allowed:
@@ -2875,6 +2977,13 @@ async def create_task(request: Request):
             routing_reason,
         )
 
+        if execution_mode == "remote" and not supabase:
+            if has_control_plane_proxy():
+                forwarded_body = dict(data)
+                forwarded_body["mode"] = mode
+                return proxy_control_plane_json(request, "/task", method="POST", json_body=forwarded_body)
+            return error_response("service_unavailable", "Remote control plane unavailable")
+
         task_id = str(uuid.uuid4())
         user_id = auth_user_id
         
@@ -2934,17 +3043,20 @@ async def create_task(request: Request):
             "user_id": user_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        insert_row_with_schema_fallback(
-            "tasks",
-            row,
-            optional_drop_order=[
-                "image_url",
-                "deep_think",
-                "model",
-                "context",
-                "created_at",
-            ],
-        )
+        if supabase:
+            insert_row_with_schema_fallback(
+                "tasks",
+                row,
+                optional_drop_order=[
+                    "image_url",
+                    "deep_think",
+                    "model",
+                    "context",
+                    "created_at",
+                ],
+            )
+        else:
+            create_local_task_record(row)
         # Only record credit ledger event for remote mode
         if execution_mode == "remote":
             record_credit_ledger_event(
@@ -2961,7 +3073,7 @@ async def create_task(request: Request):
             logger.info("task_create_local_start req_id=%s task_id=%s model=%s", request_id, task_id, model)
         else:
             logger.info("task_create_remote_queue req_id=%s task_id=%s model=%s", request_id, task_id, model)
-        updated_credit_summary = compute_user_credit_summary(user_id)
+        updated_credit_summary = compute_user_credit_summary(user_id) if supabase else build_default_credit_summary(user_id)
         return {
             "status": "success",
             "task_id": task_id,
@@ -2983,32 +3095,35 @@ async def create_task(request: Request):
 
 @app.get("/task/{task_id}")
 def get_task(task_id: str, request: Request):
-    if not supabase:
-        return error_response("service_unavailable", "Supabase credentials missing")
-
     allowed, retry_after = rate_limit_guard(request, "get_task", limit=240, window_seconds=60)
     if not allowed:
         return error_response("rate_limited", "Rate limit exceeded", retry_after=retry_after)
 
     try:
-        task = select_one_with_schema_fallback(
-            "tasks",
-            [
-                "id",
-                "status",
-                "deep_think",
-                "result",
-                "result_delta",
-                "failure_reason",
-                "user_id",
-                "miner_name",
-                "claimed_at",
-                "completed_at",
-                "created_at",
-                "context",
-            ],
-            filters=[{"op": "eq", "col": "id", "val": task_id}],
-        )
+        task = None
+        if supabase:
+            task = select_one_with_schema_fallback(
+                "tasks",
+                [
+                    "id",
+                    "status",
+                    "deep_think",
+                    "result",
+                    "result_delta",
+                    "failure_reason",
+                    "user_id",
+                    "miner_name",
+                    "claimed_at",
+                    "completed_at",
+                    "created_at",
+                    "context",
+                ],
+                filters=[{"op": "eq", "col": "id", "val": task_id}],
+            )
+        else:
+            task = get_local_task_record(task_id)
+            if not task and has_control_plane_proxy():
+                return proxy_control_plane_json(request, f"/task/{task_id}", method="GET")
         if not task:
             return error_response("not_found", "Task not found")
         request_user_id, auth_error = require_auth_user_id(request)
@@ -3096,16 +3211,19 @@ async def _task_stream_generator(task_id: str):
 @app.get("/task/{task_id}/stream")
 async def stream_task(task_id: str, request: Request):
     """SSE endpoint for real-time task updates."""
-    if not supabase:
-        return error_response("service_unavailable", "Supabase credentials missing")
-    
     # Verify task exists and user has access
     try:
-        task = select_one_with_schema_fallback(
-            "tasks",
-            ["id", "user_id", "status"],
-            filters=[{"op": "eq", "col": "id", "val": task_id}],
-        )
+        task = None
+        if supabase:
+            task = select_one_with_schema_fallback(
+                "tasks",
+                ["id", "user_id", "status"],
+                filters=[{"op": "eq", "col": "id", "val": task_id}],
+            )
+        else:
+            task = get_local_task_record(task_id)
+            if not task and has_control_plane_proxy():
+                return error_response("not_supported", "Remote streaming via local gateway is not supported")
         if not task:
             return error_response("not_found", "Task not found")
         

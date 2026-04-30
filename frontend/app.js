@@ -9,6 +9,8 @@ const DEFAULT_MODELS = ["qwen3.5:2b", "qwen3.5:9b", "qwen3.5:27b"];
 const STORAGE_KEY = "ai-reasoning-model-options";
 const USER_KEY = "ai-reasoning-user-id";
 const AUTH_TOKEN_KEY = "ai-reasoning-auth-token";
+const SUPABASE_ACCESS_TOKEN_KEY = "ai-reasoning-supabase-access-token";
+const SUPABASE_REFRESH_TOKEN_KEY = "ai-reasoning-supabase-refresh-token";
 const WORKER_KEY = "ai-reasoning-worker-name";
 const AUTO_CLAIM_KEY = "ai-reasoning-auto-claim";
 const CLAIM_CAPABILITY_KEY = "ai-reasoning-claim-capability";
@@ -51,6 +53,23 @@ function parseHashAuthParams(rawHash) {
     error: String(params.get("error") || "").trim(),
     error_description: String(params.get("error_description") || "").trim(),
   };
+}
+
+function storeSupabaseSessionTokens(accessToken = "", refreshToken = "") {
+  try {
+    const nextAccess = String(accessToken || "").trim();
+    const nextRefresh = String(refreshToken || "").trim();
+    if (nextAccess) {
+      localStorage.setItem(SUPABASE_ACCESS_TOKEN_KEY, nextAccess);
+    } else {
+      localStorage.removeItem(SUPABASE_ACCESS_TOKEN_KEY);
+    }
+    if (nextRefresh) {
+      localStorage.setItem(SUPABASE_REFRESH_TOKEN_KEY, nextRefresh);
+    } else {
+      localStorage.removeItem(SUPABASE_REFRESH_TOKEN_KEY);
+    }
+  } catch {}
 }
 
 const SUPABASE_URL = normalizeSupabaseUrl(
@@ -801,6 +820,13 @@ function getRecommendedCapacity(modelName, t = null) {
     return { tier: tr("tier_9b"), vramLabel: tr("rec_6gb") };
   }
   return { tier: tr("tier_2b"), vramLabel: tr("rec_4gb") };
+}
+
+function getLocalNoTokenTimeoutMs(modelName) {
+  const score = getModelCapabilityScore(modelName);
+  if (score >= 3) return 120 * 1000;
+  if (score >= 2) return 90 * 1000;
+  return LOCAL_NO_TOKEN_TIMEOUT_MS;
 }
 
 function formatOrderRequesterId(userId) {
@@ -2249,15 +2275,15 @@ function App() {
   const [emailInput, setEmailInput] = useState("");
   const [phoneInput, setPhoneInput] = useState("");
   const [otpInput, setOtpInput] = useState("");
-  const [isLoggedIn, setIsLoggedIn] = useState(Boolean(bootstrapAccessToken));
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [authToken, setAuthToken] = useState(() => {
     try {
-      return (localStorage.getItem(AUTH_TOKEN_KEY) || bootstrapAccessToken || "").trim();
+      return (localStorage.getItem(AUTH_TOKEN_KEY) || "").trim();
     } catch {
-      return bootstrapAccessToken || "";
+      return "";
     }
   });
-  const [authReady, setAuthReady] = useState(Boolean(bootstrapAccessToken));
+  const [authReady, setAuthReady] = useState(false);
   const [composer, setComposer] = useState("");
   const [imageAttachment, setImageAttachment] = useState(null);
   const [uploadError, setUploadError] = useState("");
@@ -2418,27 +2444,24 @@ function App() {
     }
     try {
       if (nextUserId) localStorage.setItem(USER_KEY, nextUserId);
-      localStorage.setItem(AUTH_TOKEN_KEY, token);
+      localStorage.removeItem(AUTH_TOKEN_KEY);
     } catch {}
-    setAuthToken(token);
-    setIsLoggedIn(true);
-    await refreshCredits(token);
-    jumpToChatAfterLogin();
+    storeSupabaseSessionTokens(token);
+    setAuthToken("");
+    setIsLoggedIn(false);
+    throw new Error("Gateway session exchange failed");
   };
 
   useEffect(() => {
     const hashAuth = parseHashAuthParams(window.location.hash);
     if (!hashAuth.access_token) return;
     try {
-      localStorage.setItem(AUTH_TOKEN_KEY, hashAuth.access_token);
-      if (hashAuth.refresh_token) {
-        localStorage.setItem("ai-reasoning-supabase-refresh-token", hashAuth.refresh_token);
-      }
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+      storeSupabaseSessionTokens(hashAuth.access_token, hashAuth.refresh_token);
     } catch {}
-    setAuthToken(hashAuth.access_token);
-    setIsLoggedIn(true);
-    setAuthReady(true);
-    jumpToChatAfterLogin();
+    setAuthToken("");
+    setIsLoggedIn(false);
+    setAuthReady(false);
 
     // Best-effort session repair in background; no blocking on UI transition.
     (async () => {
@@ -2453,9 +2476,7 @@ function App() {
       try {
         await exchangeSupabaseSession(hashAuth.access_token);
       } catch {
-        try {
-          await acceptSupabaseTokenLogin(hashAuth.access_token);
-        } catch {}
+        setLoginError("Gateway session exchange failed. Please sign in again.");
       }
     })();
   }, [supabaseClient]);
@@ -2522,7 +2543,7 @@ function App() {
                 refresh_token: hashAuth.refresh_token,
               });
             }
-            await acceptSupabaseTokenLogin(hashAuth.access_token);
+            await exchangeSupabaseSession(hashAuth.access_token);
             window.history.replaceState(null, "", window.location.pathname + "#chat");
             if (!cancelled) setAuthReady(true);
             return;
@@ -2541,11 +2562,6 @@ function App() {
             if (!cancelled) setAuthReady(true);
             return;
           }
-          try {
-            await acceptSupabaseTokenLogin(bootstrapToken);
-            if (!cancelled) setAuthReady(true);
-            return;
-          } catch {}
         }
 
         const savedToken = (localStorage.getItem(AUTH_TOKEN_KEY) || "").trim();
@@ -2586,7 +2602,10 @@ function App() {
           try {
             await exchangeSupabaseSession(accessToken);
           } catch {
-            await acceptSupabaseTokenLogin(accessToken, data?.session?.user?.id || "");
+            storeSupabaseSessionTokens(accessToken, data?.session?.refresh_token || "");
+            setIsLoggedIn(false);
+            setAuthToken("");
+            setLoginError("Gateway session exchange failed. Please sign in again.");
           }
         } else {
           setIsLoggedIn(false);
@@ -2635,7 +2654,10 @@ function App() {
         try {
           await exchangeSupabaseSession(nextAccessToken);
         } catch {
-          await acceptSupabaseTokenLogin(nextAccessToken, session?.user?.id || "");
+          storeSupabaseSessionTokens(nextAccessToken, session?.refresh_token || "");
+          setIsLoggedIn(false);
+          setAuthToken("");
+          throw new Error("Gateway session exchange failed");
         }
         setLoginError("");
         jumpToChatAfterLogin();
@@ -3214,11 +3236,14 @@ function App() {
       const elapsedMs = createdAtMs > 0 ? Math.max(0, nowMs - createdAtMs) : 0;
       const firstTokenMs = Number(taskContext?.metrics?.first_token_ms || 0);
       const isLocalExecution = String(taskContext.execution_mode || "").toLowerCase() === "local";
+      const modelName = String(task?.model || taskContext?.model || "").trim();
+      const localNoTokenTimeoutMs = getLocalNoTokenTimeoutMs(modelName);
+      const localNoTokenTimeoutSeconds = Math.max(1, Math.round(localNoTokenTimeoutMs / 1000));
       if (
         isLocalExecution &&
         (taskStatus === "pending" || taskStatus === "claimed" || taskStatus === "processing") &&
         firstTokenMs <= 0 &&
-        elapsedMs >= LOCAL_NO_TOKEN_TIMEOUT_MS
+        elapsedMs >= localNoTokenTimeoutMs
       ) {
         stopPolling(assistantId);
         setMessages((prev) =>
@@ -3227,7 +3252,9 @@ function App() {
               ? {
                   ...item,
                   status: "failed",
-                  content: item.content || "本地推理超时：30 秒未收到首 token，请检查本地模型与 Ollama 状态后重试。",
+                  content:
+                    item.content ||
+                    `本地推理超时：${localNoTokenTimeoutSeconds} 秒未收到首 token，请检查本地模型与 Ollama 状态后重试。`,
                   meta: {
                     ...item.meta,
                     credits: 0,
@@ -3854,7 +3881,10 @@ function App() {
       try {
         await exchangeSupabaseSession(accessToken);
       } catch {
-        await acceptSupabaseTokenLogin(accessToken, data?.session?.user?.id || "");
+        storeSupabaseSessionTokens(accessToken, data?.session?.refresh_token || "");
+        setIsLoggedIn(false);
+        setAuthToken("");
+        throw new Error("Gateway session exchange failed");
       }
       setOtpInput("");
     } catch (error) {
@@ -3878,6 +3908,7 @@ function App() {
       try {
         localStorage.removeItem(AUTH_TOKEN_KEY);
       } catch {}
+      storeSupabaseSessionTokens("", "");
     }
   };
 
