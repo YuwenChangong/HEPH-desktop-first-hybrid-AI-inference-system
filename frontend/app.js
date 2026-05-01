@@ -2237,7 +2237,10 @@ function App() {
   const pollersRef = useRef(new Map());
   const dashboardTimerRef = useRef(null);
   const ordersTimerRef = useRef(null);
+  const ordersEventSourceRef = useRef(null);
   const createTaskAbortRef = useRef(null);
+  const authSyncPromiseRef = useRef(null);
+  const authSyncTokenRef = useRef("");
   const bootstrapHashAuth = parseHashAuthParams(window.location.hash);
   const bootstrapAccessToken = String(bootstrapHashAuth.access_token || "").trim();
   const initialChatState = useMemo(() => getInitialChatState(), []);
@@ -2390,6 +2393,18 @@ function App() {
     return { Authorization: `Bearer ${authToken}` };
   }, [authToken]);
 
+  const applyOrdersSnapshot = (snapshot) => {
+    if (!snapshot || typeof snapshot !== "object") return;
+    setAvailableOrders(Array.isArray(snapshot.available_orders) ? snapshot.available_orders : []);
+    setMyOrders(Array.isArray(snapshot.my_orders) ? snapshot.my_orders : []);
+    setMyOrdersSummary(snapshot.my_orders_summary || null);
+    setLocalMineOrders(Array.isArray(snapshot.local_mine_orders) ? snapshot.local_mine_orders : []);
+    setMinerProfile(snapshot.profile || null);
+    setDashboardMetrics(snapshot.metrics || null);
+    setOrdersError("");
+    setOrdersLoading(false);
+  };
+
   const refreshOllamaRuntime = async () => {
     if (!authToken) return;
     try {
@@ -2432,6 +2447,33 @@ function App() {
     }
   };
 
+  const syncGatewaySession = async (accessToken, refreshToken = "") => {
+    const token = String(accessToken || "").trim();
+    const refresh = String(refreshToken || "").trim();
+    if (!token) throw new Error("missing access token");
+    if (authSyncPromiseRef.current && authSyncTokenRef.current === token) {
+      return await authSyncPromiseRef.current;
+    }
+    authSyncTokenRef.current = token;
+    authSyncPromiseRef.current = (async () => {
+      if (supabaseClient?.auth?.setSession && refresh) {
+        try {
+          await supabaseClient.auth.setSession({
+            access_token: token,
+            refresh_token: refresh,
+          });
+        } catch {}
+      }
+      return await exchangeSupabaseSession(token);
+    })();
+    try {
+      return await authSyncPromiseRef.current;
+    } finally {
+      authSyncPromiseRef.current = null;
+      authSyncTokenRef.current = "";
+    }
+  };
+
   const acceptSupabaseTokenLogin = async (accessToken, hintedUserId = "") => {
     const token = String(accessToken || "").trim();
     if (!token) throw new Error("missing access token");
@@ -2451,35 +2493,6 @@ function App() {
     setIsLoggedIn(false);
     throw new Error("Gateway session exchange failed");
   };
-
-  useEffect(() => {
-    const hashAuth = parseHashAuthParams(window.location.hash);
-    if (!hashAuth.access_token) return;
-    try {
-      localStorage.removeItem(AUTH_TOKEN_KEY);
-      storeSupabaseSessionTokens(hashAuth.access_token, hashAuth.refresh_token);
-    } catch {}
-    setAuthToken("");
-    setIsLoggedIn(false);
-    setAuthReady(false);
-
-    // Best-effort session repair in background; no blocking on UI transition.
-    (async () => {
-      try {
-        if (supabaseClient?.auth?.setSession && hashAuth.refresh_token) {
-          await supabaseClient.auth.setSession({
-            access_token: hashAuth.access_token,
-            refresh_token: hashAuth.refresh_token,
-          });
-        }
-      } catch {}
-      try {
-        await exchangeSupabaseSession(hashAuth.access_token);
-      } catch {
-        setLoginError("Gateway session exchange failed. Please sign in again.");
-      }
-    })();
-  }, [supabaseClient]);
 
   const exchangeSupabaseSession = async (accessToken) => {
     if (!accessToken) throw new Error("missing access token");
@@ -2537,13 +2550,7 @@ function App() {
         }
         if (hashAuth.access_token) {
           try {
-            if (supabaseClient?.auth?.setSession && hashAuth.refresh_token) {
-              await supabaseClient.auth.setSession({
-                access_token: hashAuth.access_token,
-                refresh_token: hashAuth.refresh_token,
-              });
-            }
-            await exchangeSupabaseSession(hashAuth.access_token);
+            await syncGatewaySession(hashAuth.access_token, hashAuth.refresh_token);
             window.history.replaceState(null, "", window.location.pathname + "#chat");
             if (!cancelled) setAuthReady(true);
             return;
@@ -2600,7 +2607,7 @@ function App() {
         const accessToken = data?.session?.access_token || "";
         if (accessToken) {
           try {
-            await exchangeSupabaseSession(accessToken);
+            await syncGatewaySession(accessToken, data?.session?.refresh_token || "");
           } catch {
             storeSupabaseSessionTokens(accessToken, data?.session?.refresh_token || "");
             setIsLoggedIn(false);
@@ -2627,7 +2634,8 @@ function App() {
 
   useEffect(() => {
     if (!supabaseClient) return undefined;
-    const { data } = supabaseClient.auth.onAuthStateChange(async (_evt, session) => {
+    const { data } = supabaseClient.auth.onAuthStateChange(async (evt, session) => {
+      if (evt === "INITIAL_SESSION") return;
       const nextAccessToken = session?.access_token || "";
       if (!nextAccessToken) {
         const existingToken = (() => {
@@ -2652,7 +2660,7 @@ function App() {
       }
       try {
         try {
-          await exchangeSupabaseSession(nextAccessToken);
+          await syncGatewaySession(nextAccessToken, session?.refresh_token || "");
         } catch {
           storeSupabaseSessionTokens(nextAccessToken, session?.refresh_token || "");
           setIsLoggedIn(false);
@@ -2785,6 +2793,10 @@ function App() {
       clearTimeout(ordersTimerRef.current);
       ordersTimerRef.current = null;
     }
+    if (ordersEventSourceRef.current) {
+      ordersEventSourceRef.current.close();
+      ordersEventSourceRef.current = null;
+    }
   }, []);
 
 
@@ -2794,6 +2806,10 @@ function App() {
         clearTimeout(ordersTimerRef.current);
         ordersTimerRef.current = null;
       }
+      if (ordersEventSourceRef.current) {
+        ordersEventSourceRef.current.close();
+        ordersEventSourceRef.current = null;
+      }
       return undefined;
     }
     if (!authReady || !authToken) {
@@ -2801,19 +2817,23 @@ function App() {
     }
 
     let cancelled = false;
-    const pollOrders = async () => {
+    const resolveMinerNames = () => {
+      const resolvedMinerName = String(
+        effectiveMinerName ||
+        localMinerProfile?.effective_miner_name ||
+        localMinerProfile?.miner_name ||
+        workerName
+      ).trim();
+      const localMinerName = String(localMinerProfile?.miner_name || "").trim();
+      return { resolvedMinerName, localMinerName };
+    };
+    const loadOrdersSnapshot = async () => {
       setOrdersLoading(true);
       try {
-        const resolvedMinerName = String(
-          effectiveMinerName ||
-          localMinerProfile?.effective_miner_name ||
-          localMinerProfile?.miner_name ||
-          workerName
-        ).trim();
+        const { resolvedMinerName, localMinerName } = resolveMinerNames();
         const profileQuery = new URLSearchParams();
         if (resolvedMinerName) profileQuery.set("miner_name", resolvedMinerName);
         const securedGet = (url) => fetch(url, { headers: { ...authHeaders } });
-        const localMinerName = String(localMinerProfile?.miner_name || "").trim();
         const localMinePromise = localMinerName
           ? securedGet(`${API_BASE}/orders/mine?miner_name=${encodeURIComponent(localMinerName)}&limit=200`)
           : Promise.resolve(null);
@@ -2847,13 +2867,14 @@ function App() {
           throw new Error(getApiErrorMessage(localMinePayload, "本机接单列表加载失败", lang));
         }
         if (!cancelled) {
-          setAvailableOrders(availablePayload.orders || []);
-          setMyOrders(minePayload.orders || []);
-          setMyOrdersSummary(minePayload.summary || null);
-          setLocalMineOrders(localMinePayload?.orders || []);
-          setMinerProfile(profilePayload.profile || null);
-          setDashboardMetrics(metricsPayload.metrics || null);
-          setOrdersError("");
+          applyOrdersSnapshot({
+            available_orders: availablePayload.orders || [],
+            my_orders: minePayload.orders || [],
+            my_orders_summary: minePayload.summary || null,
+            local_mine_orders: localMinePayload?.orders || [],
+            profile: profilePayload.profile || null,
+            metrics: metricsPayload.metrics || null,
+          });
         }
       } catch (error) {
         if (!cancelled) {
@@ -2862,17 +2883,63 @@ function App() {
       } finally {
         if (!cancelled) {
           setOrdersLoading(false);
-          ordersTimerRef.current = setTimeout(pollOrders, 3000);
         }
       }
     };
 
-    pollOrders();
+    const scheduleFallbackRefresh = () => {
+      if (cancelled) return;
+      if (ordersTimerRef.current) {
+        clearTimeout(ordersTimerRef.current);
+      }
+      ordersTimerRef.current = setTimeout(async () => {
+        await loadOrdersSnapshot();
+        scheduleFallbackRefresh();
+      }, 15000);
+    };
+
+    loadOrdersSnapshot();
+    scheduleFallbackRefresh();
+
+    const { resolvedMinerName, localMinerName } = resolveMinerNames();
+    const streamQuery = new URLSearchParams({
+      status: "pending",
+      source: "frontend",
+      limit: "30",
+      metrics_limit: "500",
+      auth_token: authToken,
+    });
+    if (resolvedMinerName) streamQuery.set("miner_name", resolvedMinerName);
+    if (localMinerName) streamQuery.set("local_miner_name", localMinerName);
+    const eventSource = new EventSource(`${API_BASE}/orders/stream?${streamQuery.toString()}`);
+    ordersEventSourceRef.current = eventSource;
+
+    eventSource.addEventListener("snapshot", (event) => {
+      if (cancelled) return;
+      try {
+        const payload = JSON.parse(String(event.data || "{}"));
+        if (payload?.status === "success" && payload?.snapshot) {
+          applyOrdersSnapshot(payload.snapshot);
+        }
+      } catch (error) {
+        console.error("orders snapshot parse failed", error);
+      }
+    });
+
+    eventSource.addEventListener("error", () => {
+      if (cancelled) return;
+      loadOrdersSnapshot();
+    });
+
     return () => {
       cancelled = true;
       if (ordersTimerRef.current) {
         clearTimeout(ordersTimerRef.current);
         ordersTimerRef.current = null;
+      }
+      if (ordersEventSourceRef.current) {
+        ordersEventSourceRef.current.close();
+        ordersEventSourceRef.current = null;
       }
     };
   }, [page, workerName, localMinerProfile, effectiveMinerName, authReady, authToken, authHeaders]);
@@ -2881,6 +2948,16 @@ function App() {
   const installedModelSetForAutoClaim = useMemo(
     () => new Set((installedModels || []).map((item) => String(item || "").trim()).filter(Boolean)),
     [installedModels]
+  );
+  const claimWorkerName = useMemo(
+    () =>
+      String(
+        effectiveMinerName ||
+        localMinerProfile?.effective_miner_name ||
+        localMinerProfile?.miner_name ||
+        workerName
+      ).trim(),
+    [effectiveMinerName, localMinerProfile, workerName]
   );
   const filteredAvailableOrders = availableOrders.filter((item) => {
     if (!installedModelSetForAutoClaim.has(item.model)) return false;
@@ -2891,7 +2968,7 @@ function App() {
   useEffect(() => {
     if (page !== "orders") return;
     if (!autoClaimEnabled) return;
-    if (!workerName.trim()) return;
+    if (!claimWorkerName) return;
     if (claimLoadingId) return;
 
     const hasActiveMine = myOrders.some((item) => ["claimed", "processing"].includes(String(item?.status || "").toLowerCase()));
@@ -2901,7 +2978,7 @@ function App() {
     if (!nextPending?.id) return;
 
     handleClaim(nextPending.id);
-  }, [page, autoClaimEnabled, workerName, filteredAvailableOrders, myOrders, claimLoadingId]);
+  }, [page, autoClaimEnabled, claimWorkerName, filteredAvailableOrders, myOrders, claimLoadingId]);
 
   const addModel = (name) => {
     const next = name.trim();
@@ -3575,7 +3652,7 @@ function App() {
   };
 
   const handleClaim = async (taskId) => {
-    const normalizedWorker = workerName.trim();
+    const normalizedWorker = claimWorkerName;
     if (!taskId || !normalizedWorker) return;
     setClaimLoadingId(taskId);
     try {
@@ -3879,7 +3956,7 @@ function App() {
       const accessToken = data?.session?.access_token || "";
       if (!accessToken) throw new Error("No access token");
       try {
-        await exchangeSupabaseSession(accessToken);
+        await syncGatewaySession(accessToken, data?.session?.refresh_token || "");
       } catch {
         storeSupabaseSessionTokens(accessToken, data?.session?.refresh_token || "");
         setIsLoggedIn(false);

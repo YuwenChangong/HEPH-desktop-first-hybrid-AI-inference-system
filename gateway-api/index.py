@@ -139,8 +139,10 @@ SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 SUPABASE_VERIFY_KEY = SUPABASE_ANON_KEY or KEY
 CONTROL_PLANE_BASE_URL = str(os.environ.get("CONTROL_PLANE_BASE_URL") or "").strip().rstrip("/")
 CONTROL_PLANE_TIMEOUT_SECONDS = float(os.environ.get("CONTROL_PLANE_TIMEOUT_SECONDS", "30"))
-TASK_LEASE_TIMEOUT_SECONDS = int(os.environ.get("TASK_LEASE_TIMEOUT_SECONDS", "1200"))
+TASK_LEASE_TIMEOUT_SECONDS = int(os.environ.get("TASK_LEASE_TIMEOUT_SECONDS", "250"))
+PENDING_TASK_TIMEOUT_SECONDS = int(os.environ.get("PENDING_TASK_TIMEOUT_SECONDS", "250"))
 STALE_RECOVERY_INTERVAL_SECONDS = int(os.environ.get("STALE_RECOVERY_INTERVAL_SECONDS", "15"))
+ORDER_STREAM_POLL_SECONDS = max(0.5, float(os.environ.get("ORDER_STREAM_POLL_SECONDS", "1")))
 LOCAL_MINER_PROFILE_URL = os.environ.get("LOCAL_MINER_PROFILE_URL", "http://127.0.0.1:8765/miner-profile")
 OLLAMA_COMMAND_TIMEOUT_SECONDS = int(os.environ.get("OLLAMA_COMMAND_TIMEOUT_SECONDS", "1800"))
 LOCAL_OLLAMA_READ_TIMEOUT_SECONDS = int(os.environ.get("LOCAL_OLLAMA_READ_TIMEOUT_SECONDS", "600"))
@@ -170,6 +172,7 @@ DEFAULT_MODELS = ["qwen3.5:2b", "qwen3.5:9b", "qwen3.5:27b"]
 ACTIVE_TASK_STATUSES = ["pending", "claimed", "processing"]
 TERMINAL_TASK_STATUSES = ["completed", "failed", "cancelled"]
 STALE_REQUEUE_REASON_CODE = "stale_lease_timeout"
+PENDING_EXPIRE_REASON_CODE = "pending_task_timeout"
 ALERT_PENDING_BACKLOG_THRESHOLD = int(os.environ.get("ALERT_PENDING_BACKLOG_THRESHOLD", "20"))
 ALERT_CLAIM_TIMEOUT_THRESHOLD = int(os.environ.get("ALERT_CLAIM_TIMEOUT_THRESHOLD", "1"))
 CLAIM_USE_RPC = str(os.environ.get("CLAIM_USE_RPC", "0")).lower() in ("1", "true", "yes", "on")
@@ -267,6 +270,60 @@ def proxy_control_plane_json(request: Request, path: str, method: str = "GET", j
     except Exception as e:
         logger.warning("control plane proxy failed path=%s: %s", path, e)
         return error_response("service_unavailable", "Control plane request failed")
+
+
+def proxy_control_plane_stream(request: Request, path: str, params=None):
+    if not has_control_plane_proxy():
+        async def _service_unavailable():
+            yield "event: error\ndata: {\"status\":\"error\",\"message\":\"Control plane unavailable\",\"code\":\"service_unavailable\"}\n\n"
+        return StreamingResponse(_service_unavailable(), media_type="text/event-stream")
+
+    target = f"{CONTROL_PLANE_BASE_URL}{path}"
+    token = extract_auth_bearer(request)
+    headers = {"Accept": "text/event-stream"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request_id = str(getattr(request.state, "request_id", "") or request.headers.get("x-request-id") or "")
+    if request_id:
+        headers["x-request-id"] = request_id
+
+    def _iter_stream():
+        response = None
+        try:
+            response = requests.get(
+                target,
+                headers=headers,
+                params=params,
+                stream=True,
+                timeout=(min(10, CONTROL_PLANE_TIMEOUT_SECONDS), max(30, CONTROL_PLANE_TIMEOUT_SECONDS * 4)),
+            )
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=1024):
+                if chunk:
+                    yield chunk
+        except Exception as e:
+            logger.warning("control plane stream proxy failed path=%s: %s", path, e)
+            payload = json.dumps(
+                {"status": "error", "message": "Control plane stream failed", "code": "service_unavailable"},
+                ensure_ascii=False,
+            )
+            yield f"event: error\ndata: {payload}\n\n".encode("utf-8")
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        _iter_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def get_client_ip(request: Request) -> str:
@@ -379,7 +436,7 @@ def verify_auth_token(token: str):
 def extract_auth_bearer(request: Request) -> str:
     auth = str(request.headers.get("Authorization") or "")
     if not auth.lower().startswith("bearer "):
-        return ""
+        return str(request.query_params.get("auth_token") or "").strip()
     return auth[7:].strip()
 
 
@@ -1620,7 +1677,9 @@ def try_recover_stale_tasks():
         return
     _last_stale_recovery_at = now
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=TASK_LEASE_TIMEOUT_SECONDS)).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    cutoff = (now_dt - timedelta(seconds=TASK_LEASE_TIMEOUT_SECONDS)).isoformat()
+    pending_cutoff = (now_dt - timedelta(seconds=PENDING_TASK_TIMEOUT_SECONDS)).isoformat()
     try:
         # Prefer claimed_at since this schema may not have updated_at.
         stale = (
@@ -1637,9 +1696,6 @@ def try_recover_stale_tasks():
         return
 
     stale_rows = stale.data or []
-    if not stale_rows:
-        return
-
     recovered = 0
     for row in stale_rows:
         task_id = row.get("id")
@@ -1681,6 +1737,72 @@ def try_recover_stale_tasks():
 
     if recovered:
         logger.info("Recovered %s stale task(s)", recovered)
+
+    try:
+        expired_pending = (
+            supabase.table("tasks")
+            .select("id,status,created_at,context,user_id")
+            .eq("status", "pending")
+            .lt("created_at", pending_cutoff)
+            .limit(100)
+            .execute()
+        )
+    except Exception as e:
+        logger.warning("Pending task recovery check failed: %s", e)
+        return
+
+    expired_rows = expired_pending.data or []
+    if not expired_rows:
+        return
+
+    expired = 0
+    for row in expired_rows:
+        task_id = row.get("id")
+        if not task_id:
+            continue
+        try:
+            task_context = row.get("context") if isinstance(row.get("context"), dict) else {}
+            task_user_id = str(row.get("user_id") or "").strip()
+            remote_execution = is_remote_execution(task_context)
+            refund_credits = float(extract_billing(task_context)["reserved"] or 0.0) if remote_execution else 0.0
+            safe_update_with_fallback(
+                "tasks",
+                {
+                    "status": "cancelled",
+                    "failure_reason": PENDING_EXPIRE_REASON_CODE,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                },
+                filters=[
+                    {"op": "eq", "col": "id", "val": task_id},
+                    {"op": "eq", "col": "status", "val": "pending"},
+                ],
+                optional_drop_order=["failure_reason", "completed_at"],
+            )
+            if get_task_status(task_id) == "cancelled":
+                if remote_execution and refund_credits > 0 and task_user_id:
+                    record_credit_ledger_event(
+                        task_id=task_id,
+                        phase="refunded",
+                        direction="credit",
+                        amount=refund_credits,
+                        actor_type="requester",
+                        actor_id=task_user_id,
+                        note="pending task timeout",
+                    )
+                expired += 1
+                log_transition(
+                    "pending_timeout_cancel",
+                    task_id=task_id,
+                    previous_status="pending",
+                    new_status="cancelled",
+                    reason_code=PENDING_EXPIRE_REASON_CODE,
+                    timeout_seconds=PENDING_TASK_TIMEOUT_SECONDS,
+                )
+        except Exception as e:
+            logger.warning("Expire pending task failed for %s: %s", task_id, e)
+
+    if expired:
+        logger.info("Cancelled %s expired pending task(s)", expired)
 
 
 def get_task_status(task_id, max_retries=3, retry_delay=0.1):
@@ -2072,6 +2194,210 @@ def serialize_order_task(task_row):
         "completed_at": task_row.get("completed_at"),
         "failure_reason": task_row.get("failure_reason") or "",
         "first_token_ms": metrics.get("first_token_ms"),
+    }
+
+
+def build_order_profile_payload(miner_name: str = "", hwid: str = ""):
+    if not miner_name and not hwid:
+        return {
+            "status": "success",
+            "profile": {
+                "miner_name": "",
+                "found": False,
+                "status": "unknown",
+                "vram_gb": 0,
+                "installed_models": [],
+                "capability_score": None,
+                "capability_label": "",
+            },
+        }
+
+    filters = [{"op": "eq", "col": "hwid", "val": hwid}] if hwid else [{"op": "eq", "col": "miner_name", "val": miner_name}]
+    miner = select_one_with_schema_fallback(
+        "miners",
+        [
+            "miner_name",
+            "status",
+            "last_seen",
+            "vram_gb",
+            "installed_models",
+            "completed_tasks",
+            "failed_tasks",
+        ],
+        filters=filters,
+    )
+    if not miner:
+        return {
+            "status": "success",
+            "profile": {
+                "miner_name": miner_name,
+                "found": False,
+                "status": "unknown",
+                "vram_gb": 0,
+                "installed_models": [],
+                "capability_score": None,
+                "capability_label": "",
+            },
+        }
+
+    capability = derive_model_capability(miner.get("vram_gb"))
+    return {
+        "status": "success",
+        "profile": {
+            "miner_name": miner.get("miner_name") or miner_name,
+            "found": True,
+            "status": miner.get("status") or "unknown",
+            "last_seen": miner.get("last_seen"),
+            "vram_gb": miner.get("vram_gb") or 0,
+            "installed_models": miner.get("installed_models") or [],
+            "completed_tasks": miner.get("completed_tasks") or 0,
+            "failed_tasks": miner.get("failed_tasks") or 0,
+            "capability_score": capability["score"],
+            "capability_label": capability["label"],
+        },
+    }
+
+
+def build_dashboard_metrics_payload(limit: int = 500):
+    rows = select_rows_with_schema_fallback(
+        "tasks",
+        ["id", "status", "failure_reason", "context", "created_at", "completed_at"],
+        limit=max(50, min(int(limit or 500), 2000)),
+        order_by="created_at",
+        ascending=False,
+    )
+    done = 0
+    success = 0
+    first_tokens = []
+    fail_reasons = {}
+    for row in rows:
+        status = str(row.get("status") or "").lower()
+        context = row.get("context") if isinstance(row.get("context"), dict) else {}
+        metrics = context.get("metrics") if isinstance(context.get("metrics"), dict) else {}
+        first_token_ms = metrics.get("first_token_ms")
+        if first_token_ms is not None:
+            try:
+                first_tokens.append(float(first_token_ms))
+            except Exception:
+                pass
+        if status in {"completed", "failed"}:
+            done += 1
+            if status == "completed":
+                success += 1
+            else:
+                reason = str(row.get("failure_reason") or "unknown_failure").strip()[:80] or "unknown_failure"
+                fail_reasons[reason] = int(fail_reasons.get(reason) or 0) + 1
+    success_rate = (success / done) if done else 0.0
+    top_fail = sorted(fail_reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    avg_first_token_ms = (sum(first_tokens) / len(first_tokens)) if first_tokens else 0.0
+    return {
+        "status": "success",
+        "metrics": {
+            "sample_size": len(rows),
+            "success_rate": round(success_rate, 4),
+            "avg_first_token_ms": round(avg_first_token_ms, 2),
+            "failure_top": [{"reason": k, "count": v} for k, v in top_fail],
+        },
+    }
+
+
+def build_my_orders_payload(miner_name: str, limit: int = 50):
+    safe_limit = max(1, min(int(limit or 50), 2000))
+    base_filters = [{"op": "eq", "col": "miner_name", "val": miner_name}]
+    rows = select_rows_with_schema_fallback(
+        "tasks",
+        [
+            "id",
+            "status",
+            "model",
+            "deep_think",
+            "user_id",
+            "miner_name",
+            "created_at",
+            "claimed_at",
+            "completed_at",
+            "context",
+        ],
+        filters=base_filters,
+        limit=safe_limit,
+        order_by="created_at",
+        ascending=False,
+    )
+    total_count = count_rows_with_schema_fallback("tasks", filters=base_filters)
+    claimed_count = count_rows_with_schema_fallback("tasks", filters=base_filters + [{"op": "eq", "col": "status", "val": "claimed"}])
+    processing_count = count_rows_with_schema_fallback("tasks", filters=base_filters + [{"op": "eq", "col": "status", "val": "processing"}])
+    completed_count = count_rows_with_schema_fallback("tasks", filters=base_filters + [{"op": "eq", "col": "status", "val": "completed"}])
+    failed_count = count_rows_with_schema_fallback("tasks", filters=base_filters + [{"op": "eq", "col": "status", "val": "failed"}])
+    cancelled_count = count_rows_with_schema_fallback("tasks", filters=base_filters + [{"op": "eq", "col": "status", "val": "cancelled"}])
+    return {
+        "status": "success",
+        "orders": [serialize_order_task(row) for row in rows],
+        "summary": {
+            "total_count": total_count,
+            "claimed_count": claimed_count,
+            "processing_count": processing_count,
+            "active_count": claimed_count + processing_count,
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "cancelled_count": cancelled_count,
+        },
+    }
+
+
+def build_available_orders_payload(status: str = "pending", source: str = "frontend", limit: int = 50):
+    safe_limit = max(1, min(int(limit or 50), 100))
+    status_filters = normalize_source_filters(status)
+    source_filters = normalize_source_filters(source)
+    rows = select_rows_with_schema_fallback(
+        "tasks",
+        [
+            "id",
+            "status",
+            "model",
+            "deep_think",
+            "user_id",
+            "miner_name",
+            "created_at",
+            "claimed_at",
+            "completed_at",
+            "context",
+        ],
+        limit=min(200, safe_limit * 4),
+        order_by="created_at",
+        ascending=False,
+    )
+
+    filtered = []
+    for row in rows:
+        row_status = str(row.get("status") or "").lower()
+        row_source = get_task_source(row) or "frontend"
+        if status_filters and row_status not in status_filters:
+            continue
+        if source_filters and row_source not in source_filters:
+            continue
+        filtered.append(serialize_order_task(row))
+        if len(filtered) >= safe_limit:
+            break
+    return {"status": "success", "orders": filtered}
+
+
+def build_orders_snapshot_payload(miner_name: str = "", local_miner_name: str = "", status: str = "pending", source: str = "frontend", limit: int = 30, metrics_limit: int = 500):
+    available_payload = build_available_orders_payload(status=status, source=source, limit=limit)
+    mine_payload = build_my_orders_payload(miner_name, limit=200) if miner_name else {"status": "success", "orders": [], "summary": None}
+    local_mine_payload = build_my_orders_payload(local_miner_name, limit=200) if local_miner_name else {"status": "success", "orders": []}
+    profile_payload = build_order_profile_payload(miner_name=miner_name) if miner_name else build_order_profile_payload()
+    metrics_payload = build_dashboard_metrics_payload(limit=metrics_limit)
+    return {
+        "status": "success",
+        "snapshot": {
+            "available_orders": available_payload.get("orders") or [],
+            "my_orders": mine_payload.get("orders") or [],
+            "my_orders_summary": mine_payload.get("summary"),
+            "local_mine_orders": local_mine_payload.get("orders") or [],
+            "profile": profile_payload.get("profile"),
+            "metrics": metrics_payload.get("metrics"),
+            "server_time": datetime.now(timezone.utc).isoformat(),
+        },
     }
 
 
@@ -2476,51 +2802,16 @@ def get_dispatch_dashboard(request: Request):
 @app.get("/dashboard/metrics")
 def get_dashboard_metrics(request: Request, limit: int = 500):
     if not supabase:
-        return error_response("service_unavailable", "Supabase credentials missing")
+        return proxy_control_plane_json(
+            request,
+            "/dashboard/metrics",
+            params={"limit": limit},
+        )
     request_user_id, auth_error = require_auth_user_id(request)
     if auth_error:
         return auth_error
     try:
-        rows = select_rows_with_schema_fallback(
-            "tasks",
-            ["id", "status", "failure_reason", "context", "created_at", "completed_at"],
-            limit=max(50, min(int(limit or 500), 2000)),
-            order_by="created_at",
-            ascending=False,
-        )
-        done = 0
-        success = 0
-        first_tokens = []
-        fail_reasons = {}
-        for row in rows:
-            status = str(row.get("status") or "").lower()
-            context = row.get("context") if isinstance(row.get("context"), dict) else {}
-            metrics = context.get("metrics") if isinstance(context.get("metrics"), dict) else {}
-            first_token_ms = metrics.get("first_token_ms")
-            if first_token_ms is not None:
-                try:
-                    first_tokens.append(float(first_token_ms))
-                except Exception:
-                    pass
-            if status in {"completed", "failed"}:
-                done += 1
-                if status == "completed":
-                    success += 1
-                else:
-                    reason = str(row.get("failure_reason") or "unknown_failure").strip()[:80] or "unknown_failure"
-                    fail_reasons[reason] = int(fail_reasons.get(reason) or 0) + 1
-        success_rate = (success / done) if done else 0.0
-        top_fail = sorted(fail_reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]
-        avg_first_token_ms = (sum(first_tokens) / len(first_tokens)) if first_tokens else 0.0
-        return {
-            "status": "success",
-            "metrics": {
-                "sample_size": len(rows),
-                "success_rate": round(success_rate, 4),
-                "avg_first_token_ms": round(avg_first_token_ms, 2),
-                "failure_top": [{"reason": k, "count": v} for k, v in top_fail],
-            },
-        }
+        return build_dashboard_metrics_payload(limit=limit)
     except Exception as e:
         return internal_error("/dashboard/metrics", e)
 
@@ -2528,55 +2819,100 @@ def get_dashboard_metrics(request: Request, limit: int = 500):
 @app.get("/orders")
 def list_orders(request: Request, status: str = "pending", source: str = "frontend", limit: int = 50):
     if not supabase:
-        return error_response("service_unavailable", "Supabase credentials missing")
+        return proxy_control_plane_json(
+            request,
+            "/orders",
+            params={"status": status, "source": source, "limit": limit},
+        )
     request_user_id, auth_error = require_auth_user_id(request)
     if auth_error:
         return auth_error
 
     try:
-        safe_limit = max(1, min(int(limit or 50), 100))
-        status_filters = normalize_source_filters(status)
-        source_filters = normalize_source_filters(source)
-        rows = select_rows_with_schema_fallback(
-            "tasks",
-            [
-                "id",
-                "status",
-                "model",
-                "deep_think",
-                "user_id",
-                "miner_name",
-                "created_at",
-                "claimed_at",
-                "completed_at",
-                "context",
-            ],
-            limit=min(200, safe_limit * 4),
-            order_by="created_at",
-            ascending=False,
-        )
-
-        filtered = []
-        for row in rows:
-            row_status = str(row.get("status") or "").lower()
-            row_source = get_task_source(row) or "frontend"
-            if status_filters and row_status not in status_filters:
-                continue
-            if source_filters and row_source not in source_filters:
-                continue
-            filtered.append(serialize_order_task(row))
-            if len(filtered) >= safe_limit:
-                break
-
-        return {"status": "success", "orders": filtered}
+        return build_available_orders_payload(status=status, source=source, limit=limit)
     except Exception as e:
         return internal_error("/orders", e)
+
+
+@app.get("/orders/stream")
+async def stream_orders(
+    request: Request,
+    status: str = "pending",
+    source: str = "frontend",
+    limit: int = 30,
+    miner_name: str = "",
+    local_miner_name: str = "",
+    metrics_limit: int = 500,
+):
+    if not supabase:
+        return proxy_control_plane_stream(
+            request,
+            "/orders/stream",
+            params={
+                "status": status,
+                "source": source,
+                "limit": limit,
+                "miner_name": miner_name,
+                "local_miner_name": local_miner_name,
+                "metrics_limit": metrics_limit,
+            },
+        )
+
+    request_user_id, auth_error = require_auth_user_id(request)
+    if auth_error:
+        return auth_error
+
+    async def _orders_stream_generator():
+        last_payload = ""
+        heartbeat_at = 0.0
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                try_recover_stale_tasks()
+                payload = build_orders_snapshot_payload(
+                    miner_name=miner_name,
+                    local_miner_name=local_miner_name,
+                    status=status,
+                    source=source,
+                    limit=limit,
+                    metrics_limit=metrics_limit,
+                )
+                serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                if serialized != last_payload:
+                    last_payload = serialized
+                    heartbeat_at = time.time()
+                    yield f"event: snapshot\ndata: {serialized}\n\n"
+                elif time.time() - heartbeat_at >= 15:
+                    heartbeat_at = time.time()
+                    yield "event: ping\ndata: {}\n\n"
+            except Exception as e:
+                error_payload = json.dumps(
+                    {"status": "error", "message": f"orders stream failed: {str(e)}", "code": "stream_error"},
+                    ensure_ascii=False,
+                )
+                yield f"event: error\ndata: {error_payload}\n\n"
+            await asyncio.sleep(ORDER_STREAM_POLL_SECONDS)
+
+    return StreamingResponse(
+        _orders_stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/orders/profile")
 def get_order_profile(request: Request, miner_name: str = "", hwid: str = ""):
     if not supabase:
-        return error_response("service_unavailable", "Supabase credentials missing")
+        return proxy_control_plane_json(
+            request,
+            "/orders/profile",
+            params={"miner_name": miner_name, "hwid": hwid},
+        )
     request_user_id, auth_error = require_auth_user_id(request)
     if auth_error:
         return auth_error
@@ -2584,50 +2920,7 @@ def get_order_profile(request: Request, miner_name: str = "", hwid: str = ""):
         return error_response("bad_request", "Missing miner_name or hwid")
 
     try:
-        filters = [{"op": "eq", "col": "hwid", "val": hwid}] if hwid else [{"op": "eq", "col": "miner_name", "val": miner_name}]
-        miner = select_one_with_schema_fallback(
-            "miners",
-            [
-                "miner_name",
-                "status",
-                "last_seen",
-                "vram_gb",
-                "installed_models",
-                "completed_tasks",
-                "failed_tasks",
-            ],
-            filters=filters,
-        )
-        if not miner:
-            return {
-                "status": "success",
-                "profile": {
-                    "miner_name": miner_name,
-                    "found": False,
-                    "status": "unknown",
-                "vram_gb": 0,
-                "installed_models": [],
-                "capability_score": None,
-                "capability_label": "",
-                },
-            }
-
-        capability = derive_model_capability(miner.get("vram_gb"))
-        return {
-            "status": "success",
-            "profile": {
-                "miner_name": miner.get("miner_name") or miner_name,
-                "found": True,
-                "status": miner.get("status") or "unknown",
-                "last_seen": miner.get("last_seen"),
-                "vram_gb": miner.get("vram_gb") or 0,
-                "installed_models": miner.get("installed_models") or [],
-                "completed_tasks": miner.get("completed_tasks") or 0,
-                "failed_tasks": miner.get("failed_tasks") or 0,
-                "capability_score": capability["score"],
-                "capability_label": capability["label"],
-            },
-        }
+        return build_order_profile_payload(miner_name=miner_name, hwid=hwid)
     except Exception as e:
         return internal_error("/orders/profile", e)
 
@@ -2717,7 +3010,11 @@ async def install_or_repair_ollama(request: Request):
 @app.get("/orders/mine")
 def list_my_orders(request: Request, miner_name: str, limit: int = 50):
     if not supabase:
-        return error_response("service_unavailable", "Supabase credentials missing")
+        return proxy_control_plane_json(
+            request,
+            "/orders/mine",
+            params={"miner_name": miner_name, "limit": limit},
+        )
     request_user_id, auth_error = require_auth_user_id(request)
     if auth_error:
         return auth_error
@@ -2725,61 +3022,7 @@ def list_my_orders(request: Request, miner_name: str, limit: int = 50):
         return error_response("bad_request", "Missing miner_name")
 
     try:
-        safe_limit = max(1, min(int(limit or 50), 2000))
-        base_filters = [{"op": "eq", "col": "miner_name", "val": miner_name}]
-        rows = select_rows_with_schema_fallback(
-            "tasks",
-            [
-                "id",
-                "status",
-                "model",
-                "deep_think",
-                "user_id",
-                "miner_name",
-                "created_at",
-                "claimed_at",
-                "completed_at",
-                "context",
-            ],
-            filters=base_filters,
-            limit=safe_limit,
-            order_by="created_at",
-            ascending=False,
-        )
-        total_count = count_rows_with_schema_fallback("tasks", filters=base_filters)
-        claimed_count = count_rows_with_schema_fallback(
-            "tasks",
-            filters=base_filters + [{"op": "eq", "col": "status", "val": "claimed"}],
-        )
-        processing_count = count_rows_with_schema_fallback(
-            "tasks",
-            filters=base_filters + [{"op": "eq", "col": "status", "val": "processing"}],
-        )
-        completed_count = count_rows_with_schema_fallback(
-            "tasks",
-            filters=base_filters + [{"op": "eq", "col": "status", "val": "completed"}],
-        )
-        failed_count = count_rows_with_schema_fallback(
-            "tasks",
-            filters=base_filters + [{"op": "eq", "col": "status", "val": "failed"}],
-        )
-        cancelled_count = count_rows_with_schema_fallback(
-            "tasks",
-            filters=base_filters + [{"op": "eq", "col": "status", "val": "cancelled"}],
-        )
-        return {
-            "status": "success",
-            "orders": [serialize_order_task(row) for row in rows],
-            "summary": {
-                "total_count": total_count,
-                "claimed_count": claimed_count,
-                "processing_count": processing_count,
-                "active_count": claimed_count + processing_count,
-                "completed_count": completed_count,
-                "failed_count": failed_count,
-                "cancelled_count": cancelled_count,
-            },
-        }
+        return build_my_orders_payload(miner_name=miner_name, limit=limit)
     except Exception as e:
         return internal_error("/orders/mine", e)
 
@@ -2787,7 +3030,16 @@ def list_my_orders(request: Request, miner_name: str, limit: int = 50):
 @app.post("/orders/claim")
 async def claim_order_manually(request: Request):
     if not supabase:
-        return error_response("service_unavailable", "Supabase credentials missing")
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        return proxy_control_plane_json(
+            request,
+            "/orders/claim",
+            method="POST",
+            json_body=data,
+        )
     request_user_id, auth_error = require_auth_user_id(request)
     if auth_error:
         return auth_error
@@ -3665,7 +3917,16 @@ async def fail_task(request: Request):
 @app.post("/cancel")
 async def cancel_task(request: Request):
     if not supabase:
-        return error_response("service_unavailable", "Supabase credentials missing")
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        return proxy_control_plane_json(
+            request,
+            "/cancel",
+            method="POST",
+            json_body=data,
+        )
 
     allowed, retry_after = rate_limit_guard(request, "cancel_task", limit=120, window_seconds=60)
     if not allowed:
