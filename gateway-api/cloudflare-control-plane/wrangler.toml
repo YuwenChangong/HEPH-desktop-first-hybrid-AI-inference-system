@@ -1,0 +1,11 @@
+name = "heph-control-plane"
+main = "src/index.js"
+compatibility_date = "2026-05-03"
+
+[vars]
+TASK_LEASE_TIMEOUT_SECONDS = "250"
+PENDING_TASK_TIMEOUT_SECONDS = "250"
+ORDER_STREAM_POLL_SECONDS = "1"
+DEFAULT_USER_CREDITS = "0"
+MESSAGE_CREDIT_COST = "0.1"
+MINER_REWARD_CREDIT = "0.1"
