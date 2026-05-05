@@ -2612,6 +2612,17 @@ function App() {
     return false;
   };
 
+  const preserveStoredGatewaySession = () => {
+    const candidates = getStoredGatewayTokenCandidate();
+    const token = String(candidates[0] || "").trim();
+    if (!token) return false;
+    setAuthToken(token);
+    setIsLoggedIn(true);
+    appendAuthDebugLog("gateway.preserve_session", token.slice(0, 12));
+    jumpToChatAfterLogin();
+    return true;
+  };
+
   const refreshCredits = async (token = authToken) => {
     const validated = await validateGatewaySessionToken(token);
     if (validated.ok) return true;
@@ -2700,7 +2711,7 @@ function App() {
         } else {
           const recovered = await keepGatewaySessionIfPossible();
           if (!recovered) {
-            setIsLoggedIn(false);
+            preserveStoredGatewaySession();
           }
         }
       } catch (error) {
@@ -2708,8 +2719,10 @@ function App() {
           appendAuthDebugLog("bootstrap.error", String(error?.message || error));
           const recovered = await keepGatewaySessionIfPossible();
           if (!recovered) {
-            setIsLoggedIn(false);
-            setLoginError(String(error?.message || error));
+            if (!preserveStoredGatewaySession()) {
+              setIsLoggedIn(false);
+              setLoginError(String(error?.message || error));
+            }
           }
         }
       } finally {
@@ -2739,6 +2752,10 @@ function App() {
         const recovered = await keepGatewaySessionIfPossible();
         if (recovered) {
           appendAuthDebugLog("supabase.empty_session.recovered");
+          return;
+        }
+        if (preserveStoredGatewaySession()) {
+          appendAuthDebugLog("supabase.empty_session.preserved");
           return;
         }
         appendAuthDebugLog("supabase.empty_session.logout");
