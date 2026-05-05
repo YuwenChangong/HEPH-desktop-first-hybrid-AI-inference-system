@@ -2693,12 +2693,12 @@ function App() {
             if (!cancelled) setAuthReady(true);
             return;
           }
-          try {
-            localStorage.removeItem(AUTH_TOKEN_KEY);
-          } catch {}
-          setAuthToken("");
-          setIsLoggedIn(false);
+          appendAuthDebugLog("bootstrap.saved_token_stale_preserved");
+          setAuthToken(savedToken);
+          setIsLoggedIn(true);
+          jumpToChatAfterLogin();
           if (!cancelled) setAuthReady(true);
+          return;
         }
         if (!supabaseClient) {
           setLoginError(t("login_missing_cfg"));
@@ -2769,6 +2769,10 @@ function App() {
           appendAuthDebugLog("supabase.signed_out.recovered");
           return;
         }
+        if (preserveStoredGatewaySession()) {
+          appendAuthDebugLog("supabase.signed_out.preserved");
+          return;
+        }
       }
       const nextAccessToken = session?.access_token || "";
       if (!nextAccessToken) {
@@ -2781,12 +2785,7 @@ function App() {
           appendAuthDebugLog("supabase.empty_session.preserved");
           return;
         }
-        appendAuthDebugLog("supabase.empty_session.logout");
-        setIsLoggedIn(false);
-        setAuthToken("");
-        try {
-          localStorage.removeItem(AUTH_TOKEN_KEY);
-        } catch {}
+        appendAuthDebugLog("supabase.empty_session.ignored");
         return;
       }
       try {
