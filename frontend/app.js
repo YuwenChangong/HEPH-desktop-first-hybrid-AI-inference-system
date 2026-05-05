@@ -2489,8 +2489,9 @@ function App() {
     }
   };
 
-  const acceptSupabaseTokenLogin = async (accessToken, hintedUserId = "") => {
+  const acceptSupabaseTokenLogin = async (accessToken, hintedUserId = "", refreshToken = "") => {
     const token = String(accessToken || "").trim();
+    const refresh = String(refreshToken || "").trim();
     if (!token) throw new Error("missing access token");
     let nextUserId = String(hintedUserId || "").trim();
     if (!nextUserId && supabaseClient?.auth?.getUser) {
@@ -2499,11 +2500,19 @@ function App() {
         nextUserId = String(data?.user?.id || "").trim();
       } catch {}
     }
+    if (supabaseClient?.auth?.setSession && refresh) {
+      try {
+        await supabaseClient.auth.setSession({
+          access_token: token,
+          refresh_token: refresh,
+        });
+      } catch {}
+    }
     try {
       if (nextUserId) localStorage.setItem(USER_KEY, nextUserId);
       localStorage.setItem(AUTH_TOKEN_KEY, token);
     } catch {}
-    storeSupabaseSessionTokens(token);
+    storeSupabaseSessionTokens(token, refresh);
     setAuthToken(token);
     setIsLoggedIn(true);
     appendAuthDebugLog("acceptSupabaseTokenLogin.fallback", nextUserId || "no-user-id");
@@ -2648,7 +2657,7 @@ function App() {
             return;
           } catch (hashTokenError) {
             appendAuthDebugLog("bootstrap.hash_exchange_failed", String(hashTokenError?.message || hashTokenError));
-            await acceptSupabaseTokenLogin(hashAuth.access_token);
+            await acceptSupabaseTokenLogin(hashAuth.access_token, "", hashAuth.refresh_token);
             window.history.replaceState(null, "", window.location.pathname + "#chat");
             if (!cancelled) setAuthReady(true);
             return;
@@ -2665,6 +2674,10 @@ function App() {
             if (!cancelled) setAuthReady(true);
             return;
           }
+          if (preserveStoredGatewaySession()) {
+            if (!cancelled) setAuthReady(true);
+            return;
+          }
         }
 
         const savedToken = (localStorage.getItem(AUTH_TOKEN_KEY) || "").trim();
@@ -2673,6 +2686,10 @@ function App() {
           const ok = await refreshCredits(savedToken);
           if (ok) {
             setIsLoggedIn(true);
+            if (!cancelled) setAuthReady(true);
+            return;
+          }
+          if (preserveStoredGatewaySession()) {
             if (!cancelled) setAuthReady(true);
             return;
           }
@@ -2685,7 +2702,9 @@ function App() {
         }
         if (!supabaseClient) {
           setLoginError(t("login_missing_cfg"));
-          setIsLoggedIn(false);
+          if (!preserveStoredGatewaySession()) {
+            setIsLoggedIn(false);
+          }
           if (!cancelled) setAuthReady(true);
           return;
         }
@@ -2706,7 +2725,11 @@ function App() {
             await syncGatewaySession(accessToken, data?.session?.refresh_token || "");
           } catch {
             appendAuthDebugLog("bootstrap.session_exchange_failed");
-            await acceptSupabaseTokenLogin(accessToken, data?.session?.user?.id || "");
+            await acceptSupabaseTokenLogin(
+              accessToken,
+              data?.session?.user?.id || "",
+              data?.session?.refresh_token || ""
+            );
           }
         } else {
           const recovered = await keepGatewaySessionIfPossible();
@@ -2771,7 +2794,11 @@ function App() {
           await syncGatewaySession(nextAccessToken, session?.refresh_token || "");
         } catch {
           appendAuthDebugLog("supabase.session_exchange_failed");
-          await acceptSupabaseTokenLogin(nextAccessToken, session?.user?.id || "");
+          await acceptSupabaseTokenLogin(
+            nextAccessToken,
+            session?.user?.id || "",
+            session?.refresh_token || ""
+          );
           return;
         }
         setLoginError("");
@@ -4069,7 +4096,11 @@ function App() {
         await syncGatewaySession(accessToken, data?.session?.refresh_token || "");
       } catch {
         appendAuthDebugLog("otp.session_exchange_failed");
-        await acceptSupabaseTokenLogin(accessToken, data?.session?.user?.id || "");
+        await acceptSupabaseTokenLogin(
+          accessToken,
+          data?.session?.user?.id || "",
+          data?.session?.refresh_token || ""
+        );
       }
       setOtpInput("");
     } catch (error) {
