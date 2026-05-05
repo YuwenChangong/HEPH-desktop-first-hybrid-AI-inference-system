@@ -2279,6 +2279,7 @@ function App() {
   const [phoneInput, setPhoneInput] = useState("");
   const [otpInput, setOtpInput] = useState("");
   const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const explicitSignOutRef = useRef(false);
   const [authToken, setAuthToken] = useState(() => {
     try {
       return (localStorage.getItem(AUTH_TOKEN_KEY) || "").trim();
@@ -2325,6 +2326,20 @@ function App() {
     }, 3000);
     return () => clearTimeout(timer);
   }, []);
+
+  const appendAuthDebugLog = (event, detail = "") => {
+    try {
+      const key = "heph-auth-debug-log";
+      const current = JSON.parse(localStorage.getItem(key) || "[]");
+      const next = Array.isArray(current) ? current : [];
+      next.push({
+        ts: new Date().toISOString(),
+        event: String(event || ""),
+        detail: String(detail || ""),
+      });
+      localStorage.setItem(key, JSON.stringify(next.slice(-80)));
+    } catch {}
+  };
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(modelOptions));
@@ -2486,12 +2501,14 @@ function App() {
     }
     try {
       if (nextUserId) localStorage.setItem(USER_KEY, nextUserId);
-      localStorage.removeItem(AUTH_TOKEN_KEY);
+      localStorage.setItem(AUTH_TOKEN_KEY, token);
     } catch {}
     storeSupabaseSessionTokens(token);
-    setAuthToken("");
-    setIsLoggedIn(false);
-    throw new Error("Gateway session exchange failed");
+    setAuthToken(token);
+    setIsLoggedIn(true);
+    appendAuthDebugLog("acceptSupabaseTokenLogin.fallback", nextUserId || "no-user-id");
+    jumpToChatAfterLogin();
+    return { status: "success", session: { token, user_id: nextUserId } };
   };
 
   const exchangeSupabaseSession = async (accessToken) => {
@@ -2519,25 +2536,89 @@ function App() {
     return payload;
   };
 
-  const refreshCredits = async (token = authToken) => {
-    if (!token) return false;
+  const validateGatewaySessionToken = async (tokenCandidate) => {
+    const token = String(tokenCandidate || "").trim();
+    if (!token) return { ok: false, reason: "missing" };
     try {
       const response = await fetch(`${API_BASE}/credits/me`, {
         headers: {
-          ...authHeaders,
-          ...(token !== authToken ? { Authorization: `Bearer ${token}` } : {}),
+          Authorization: `Bearer ${token}`,
         },
       });
-      if (!response.ok) return false;
-      const payload = await response.json();
-      if (payload?.status === "success" && payload?.credits) {
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && payload?.status === "success" && payload?.credits) {
         setCredits(Number(payload.credits.available || 0));
-        return true;
+        appendAuthDebugLog("gateway.validate.ok", token.slice(0, 12));
+        return { ok: true, token };
       }
-      return false;
-    } catch {
-      return false;
+      if (response.status === 401 || response.status === 403 || payload?.code === "unauthorized") {
+        appendAuthDebugLog("gateway.validate.unauthorized", `${response.status}`);
+        return { ok: false, reason: "unauthorized" };
+      }
+      appendAuthDebugLog("gateway.validate.transient", `${response.status}`);
+      return { ok: false, reason: "transient", payload, status: response.status };
+    } catch (error) {
+      appendAuthDebugLog("gateway.validate.network", String(error?.message || error));
+      return { ok: false, reason: "network", error };
     }
+  };
+
+  const getStoredGatewayTokenCandidate = () => {
+    const candidates = [];
+    const current = String(authToken || "").trim();
+    if (current) candidates.push(current);
+    try {
+      const stored = String(localStorage.getItem(AUTH_TOKEN_KEY) || "").trim();
+      if (stored && !candidates.includes(stored)) {
+        candidates.push(stored);
+      }
+    } catch {}
+    return candidates;
+  };
+
+  const recoverExistingGatewaySession = async () => {
+    const candidates = getStoredGatewayTokenCandidate();
+    let sawIndeterminate = false;
+
+    for (const candidate of candidates) {
+      const validated = await validateGatewaySessionToken(candidate);
+      if (validated.ok) {
+        setAuthToken(candidate);
+        setIsLoggedIn(true);
+        jumpToChatAfterLogin();
+        return { status: "valid", token: candidate };
+      }
+      if (validated.reason === "transient" || validated.reason === "network") {
+        sawIndeterminate = true;
+      }
+    }
+    if (sawIndeterminate && candidates.length > 0) {
+      return { status: "indeterminate", token: candidates[0] };
+    }
+    return { status: "invalid", token: "" };
+  };
+
+  const keepGatewaySessionIfPossible = async () => {
+    const recovered = await recoverExistingGatewaySession();
+    if (recovered.status === "valid") {
+      return true;
+    }
+    if (recovered.status === "indeterminate" && recovered.token) {
+      setAuthToken(recovered.token);
+      setIsLoggedIn(true);
+      jumpToChatAfterLogin();
+      return true;
+    }
+    return false;
+  };
+
+  const refreshCredits = async (token = authToken) => {
+    const validated = await validateGatewaySessionToken(token);
+    if (validated.ok) return true;
+    if (validated.reason === "transient" || validated.reason === "network") {
+      return Boolean(String(token || "").trim());
+    }
+    return false;
   };
 
   useEffect(() => {
@@ -2555,7 +2636,11 @@ function App() {
             if (!cancelled) setAuthReady(true);
             return;
           } catch (hashTokenError) {
-            setLoginError(String(hashTokenError?.message || hashTokenError));
+            appendAuthDebugLog("bootstrap.hash_exchange_failed", String(hashTokenError?.message || hashTokenError));
+            await acceptSupabaseTokenLogin(hashAuth.access_token);
+            window.history.replaceState(null, "", window.location.pathname + "#chat");
+            if (!cancelled) setAuthReady(true);
+            return;
           }
         }
 
@@ -2609,18 +2694,23 @@ function App() {
           try {
             await syncGatewaySession(accessToken, data?.session?.refresh_token || "");
           } catch {
-            storeSupabaseSessionTokens(accessToken, data?.session?.refresh_token || "");
-            setIsLoggedIn(false);
-            setAuthToken("");
-            setLoginError("Gateway session exchange failed. Please sign in again.");
+            appendAuthDebugLog("bootstrap.session_exchange_failed");
+            await acceptSupabaseTokenLogin(accessToken, data?.session?.user?.id || "");
           }
         } else {
-          setIsLoggedIn(false);
+          const recovered = await keepGatewaySessionIfPossible();
+          if (!recovered) {
+            setIsLoggedIn(false);
+          }
         }
       } catch (error) {
         if (!cancelled) {
-          setIsLoggedIn(false);
-          setLoginError(String(error?.message || error));
+          appendAuthDebugLog("bootstrap.error", String(error?.message || error));
+          const recovered = await keepGatewaySessionIfPossible();
+          if (!recovered) {
+            setIsLoggedIn(false);
+            setLoginError(String(error?.message || error));
+          }
         }
       } finally {
         if (!cancelled) setAuthReady(true);
@@ -2635,22 +2725,23 @@ function App() {
   useEffect(() => {
     if (!supabaseClient) return undefined;
     const { data } = supabaseClient.auth.onAuthStateChange(async (evt, session) => {
+      appendAuthDebugLog("supabase.auth_event", evt);
       if (evt === "INITIAL_SESSION") return;
-      const nextAccessToken = session?.access_token || "";
-      if (!nextAccessToken) {
-        const existingToken = (() => {
-          try {
-            return (localStorage.getItem(AUTH_TOKEN_KEY) || "").trim();
-          } catch {
-            return "";
-          }
-        })();
-        if (existingToken) {
-          setAuthToken(existingToken);
-          setIsLoggedIn(true);
-          jumpToChatAfterLogin();
+      if (evt === "SIGNED_OUT" && !explicitSignOutRef.current) {
+        const recovered = await keepGatewaySessionIfPossible();
+        if (recovered) {
+          appendAuthDebugLog("supabase.signed_out.recovered");
           return;
         }
+      }
+      const nextAccessToken = session?.access_token || "";
+      if (!nextAccessToken) {
+        const recovered = await keepGatewaySessionIfPossible();
+        if (recovered) {
+          appendAuthDebugLog("supabase.empty_session.recovered");
+          return;
+        }
+        appendAuthDebugLog("supabase.empty_session.logout");
         setIsLoggedIn(false);
         setAuthToken("");
         try {
@@ -2662,14 +2753,16 @@ function App() {
         try {
           await syncGatewaySession(nextAccessToken, session?.refresh_token || "");
         } catch {
-          storeSupabaseSessionTokens(nextAccessToken, session?.refresh_token || "");
-          setIsLoggedIn(false);
-          setAuthToken("");
-          throw new Error("Gateway session exchange failed");
+          appendAuthDebugLog("supabase.session_exchange_failed");
+          await acceptSupabaseTokenLogin(nextAccessToken, session?.user?.id || "");
+          return;
         }
         setLoginError("");
+        setIsLoggedIn(true);
+        appendAuthDebugLog("supabase.auth_event.applied", evt);
         jumpToChatAfterLogin();
       } catch (e) {
+        appendAuthDebugLog("supabase.auth_event.error", String(e?.message || e));
         setLoginError(String(e?.message || e));
       }
     });
@@ -3958,10 +4051,8 @@ function App() {
       try {
         await syncGatewaySession(accessToken, data?.session?.refresh_token || "");
       } catch {
-        storeSupabaseSessionTokens(accessToken, data?.session?.refresh_token || "");
-        setIsLoggedIn(false);
-        setAuthToken("");
-        throw new Error("Gateway session exchange failed");
+        appendAuthDebugLog("otp.session_exchange_failed");
+        await acceptSupabaseTokenLogin(accessToken, data?.session?.user?.id || "");
       }
       setOtpInput("");
     } catch (error) {
@@ -3972,6 +4063,8 @@ function App() {
   };
 
   const handleSignOut = async () => {
+    explicitSignOutRef.current = true;
+    appendAuthDebugLog("signout.explicit");
     setLoginError("");
     try {
       if (supabaseClient?.auth?.signOut) {
@@ -3986,6 +4079,7 @@ function App() {
         localStorage.removeItem(AUTH_TOKEN_KEY);
       } catch {}
       storeSupabaseSessionTokens("", "");
+      explicitSignOutRef.current = false;
     }
   };
 
