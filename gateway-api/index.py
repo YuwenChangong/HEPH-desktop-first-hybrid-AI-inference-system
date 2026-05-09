@@ -156,6 +156,7 @@ APP_DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or RUNTIME_ROOT_DIR, 
 APP_DOWNLOAD_DIR = os.path.join(APP_DATA_DIR, "downloads")
 LOCAL_HISTORY_MESSAGES = int(os.environ.get("LOCAL_HISTORY_MESSAGES", "3"))
 LOCAL_HISTORY_CONTENT_CHARS = int(os.environ.get("LOCAL_HISTORY_CONTENT_CHARS", "300"))
+LOCAL_PROMPT_CHAR_LIMIT = int(os.environ.get("PROMPT_CHAR_LIMIT", "3000"))
 LOCAL_NORMAL_NUM_PREDICT = int(os.environ.get("LOCAL_NORMAL_NUM_PREDICT", "2048"))
 LOCAL_DEEP_NUM_PREDICT = int(os.environ.get("LOCAL_DEEP_NUM_PREDICT", "1200"))
 LOCAL_OLLAMA_NUM_CTX = int(os.environ.get("LOCAL_OLLAMA_NUM_CTX", "2048"))
@@ -193,11 +194,16 @@ _http_status_counters = defaultdict(int)
 _http_path_counters = defaultdict(int)
 
 # In-memory SSE stream cache for local tasks to avoid Supabase round-trips
-_task_stream_queues = {}  # task_id -> asyncio.Queue
+# task_id -> {"queue": asyncio.Queue, "loop": asyncio.AbstractEventLoop | None}
+_task_stream_queues = {}
 _task_stream_lock = threading.Lock()
 _task_stream_ttl_seconds = 600  # Keep streams for 10 minutes after completion
 _local_task_records = {}
 _local_task_lock = threading.Lock()
+_local_ollama_models_cache = {"models": [], "expires_at": 0.0}
+_local_ollama_models_lock = threading.Lock()
+_local_gpu_vram_cache = {"value": 0.0, "expires_at": 0.0}
+_local_gpu_vram_lock = threading.Lock()
 SUPABASE_RETRY_ATTEMPTS = int(os.environ.get("SUPABASE_RETRY_ATTEMPTS", "3"))
 SUPABASE_RETRY_BASE_DELAY_SECONDS = float(os.environ.get("SUPABASE_RETRY_BASE_DELAY_SECONDS", "0.25"))
 
@@ -875,10 +881,18 @@ def parse_ollama_list_stdout(output):
 
 
 def list_local_ollama_models():
+    now = time.time()
+    with _local_ollama_models_lock:
+        if _local_ollama_models_cache["expires_at"] > now:
+            return list(_local_ollama_models_cache["models"])
     result = run_allowed_ollama_command("list")
-    if result["exit_code"] != 0:
-        return []
-    return parse_ollama_list_stdout(result.get("stdout") or "")
+    models = []
+    if result["exit_code"] == 0:
+        models = parse_ollama_list_stdout(result.get("stdout") or "")
+    with _local_ollama_models_lock:
+        _local_ollama_models_cache["models"] = list(models)
+        _local_ollama_models_cache["expires_at"] = now + 15.0
+    return list(models)
 
 
 def local_ollama_has_model(model_name):
@@ -1019,6 +1033,26 @@ def normalize_model_output(text, deep_think):
     return f"<answer>{cleaned}</answer>"
 
 
+def normalize_partial_model_output(text, deep_think):
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if deep_think:
+        return normalize_model_output(raw, True)
+    answer = extract_tag_content(raw, "answer")
+    if answer:
+        return f"<answer>{answer}</answer>"
+    if "</think>" in raw.lower():
+        tail = re.split(r"</think>", raw, flags=re.IGNORECASE)[-1]
+        tail = re.sub(r"</?(?:think|answer)>", "", tail, flags=re.IGNORECASE).strip()
+        return f"<answer>{tail}</answer>" if tail else ""
+    cleaned = re.sub(r"<think>.*?(?:</think>|$)", "", raw, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"</?(?:think|answer)>", "", cleaned, flags=re.IGNORECASE).strip()
+    if not cleaned:
+        cleaned = re.sub(r"[<>]", "", raw).strip()
+    return f"<answer>{cleaned}</answer>" if cleaned else ""
+
+
 def looks_like_reasoning_leak(text):
     sample = str(text or "").strip()[:320].lower()
     if not sample:
@@ -1139,22 +1173,123 @@ def repair_local_standard_answer(model, prompt, leaked_text):
     return "<answer>回答格式异常，请重新生成。</answer>"
 
 
+def extract_local_generate_texts(payload):
+    if payload is None:
+        return "", ""
+    if isinstance(payload, dict):
+        response_text = str(payload.get("response", "") or "")
+        content_text = str(payload.get("content", "") or "")
+        msg = payload.get("message")
+        if isinstance(msg, dict):
+            content_text = content_text or str(msg.get("content", "") or "")
+        thinking_text = str(payload.get("thinking", "") or "")
+    else:
+        response_text = str(getattr(payload, "response", "") or "")
+        content_text = str(getattr(payload, "content", "") or "")
+        msg = getattr(payload, "message", None)
+        content_text = content_text or str(getattr(msg, "content", "") or "")
+        thinking_text = str(getattr(payload, "thinking", "") or "")
+    answer_text = response_text or content_text
+    return thinking_text, answer_text
+
+
+def local_ollama_generate_once(model, prompt, generation_options, deep_think=False):
+    response = requests.post(
+        "http://127.0.0.1:11434/api/generate",
+        json={
+            "model": model,
+            "prompt": prompt,
+            "keep_alive": "30m",
+            "stream": False,
+            "options": generation_options,
+        },
+        timeout=(5, LOCAL_OLLAMA_READ_TIMEOUT_SECONDS),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    thinking_text, answer_text = extract_local_generate_texts(payload)
+    if answer_text.strip():
+        return answer_text
+    if not deep_think and thinking_text.strip():
+        return thinking_text
+    return ""
+
+
 def build_local_prompt(prompt, context, deep_think):
-    history = context.get("history") if isinstance(context, dict) else None
-    history_lines = []
-    if isinstance(history, list):
-        for item in history[-LOCAL_HISTORY_MESSAGES:]:
-            role = str(item.get("role") or "").strip()
-            content = sanitize_history_message(role, item.get("content"))
-            if role and content:
-                if len(content) > LOCAL_HISTORY_CONTENT_CHARS:
-                    content = content[:LOCAL_HISTORY_CONTENT_CHARS].rstrip() + "\n...(truncated)"
-                history_lines.append(f"{role}: {content}")
-    history_text = "\n".join(history_lines)
     protocol = build_universal_llm_protocol(deep_think)
-    if history_text:
-        return f"{protocol}\n\nConversation history:\n{history_text}\n\nUser:\n{prompt}"
-    return f"{protocol}\n\nUser:\n{prompt}"
+    if not isinstance(context, dict):
+        return f"{protocol}\n\nUser:\n{prompt}"
+
+    history = context.get("history")
+    if not isinstance(history, list):
+        return f"{protocol}\n\nUser:\n{prompt}"
+
+    normalized_history = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip().lower()
+        if role not in ("user", "assistant"):
+            continue
+        content = sanitize_history_message(role, item.get("content", ""))
+        if not content:
+            continue
+        normalized_history.append((role, content))
+
+    if not normalized_history:
+        return f"{protocol}\n\nUser:\n{prompt}"
+
+    current_prompt = str(prompt or "")
+    prompt_reserve = min(max(400, len(current_prompt) + 80), max(400, LOCAL_PROMPT_CHAR_LIMIT - 200))
+    history_budget = max(200, LOCAL_PROMPT_CHAR_LIMIT - prompt_reserve)
+    recent_budget = max(160, int(history_budget * 0.7))
+    summary_budget = max(120, history_budget - recent_budget)
+    recent_lines = []
+    recent_consumed = 0
+    recent_start_index = len(normalized_history)
+
+    for index in range(len(normalized_history) - 1, -1, -1):
+        role, content = normalized_history[index]
+        prefix = "User" if role == "user" else "Assistant"
+        cleaned = content.replace("\r\n", "\n").strip()
+        if len(cleaned) > LOCAL_HISTORY_CONTENT_CHARS:
+            cleaned = cleaned[:LOCAL_HISTORY_CONTENT_CHARS] + "..."
+        line = f"{prefix}: {cleaned}"
+        line_cost = len(line) + 1
+        if recent_lines and recent_consumed + line_cost > recent_budget:
+            break
+        if not recent_lines and line_cost > recent_budget:
+            cleaned = cleaned[:max(80, recent_budget - len(prefix) - 6)] + "..."
+            line = f"{prefix}: {cleaned}"
+            line_cost = len(line) + 1
+        recent_lines.append(line)
+        recent_consumed += line_cost
+        recent_start_index = index
+
+    summary_lines = []
+    summary_consumed = 0
+    for role, content in normalized_history[:recent_start_index]:
+        prefix = "User asked" if role == "user" else "Assistant replied"
+        cleaned = " ".join(content.replace("\r\n", "\n").split())
+        if len(cleaned) > 140:
+            cleaned = cleaned[:140] + "..."
+        line = f"- {prefix}: {cleaned}"
+        line_cost = len(line) + 1
+        if summary_consumed + line_cost > summary_budget:
+            remaining = summary_budget - summary_consumed
+            if remaining > 40:
+                summary_lines.append(line[:remaining - 3] + "...")
+            break
+        summary_lines.append(line)
+        summary_consumed += line_cost
+
+    sections = [protocol]
+    if summary_lines:
+        sections.append("Earlier conversation summary:\n" + "\n".join(summary_lines))
+    if recent_lines:
+        sections.append("Recent conversation:\n" + "\n".join(reversed(recent_lines)))
+    sections.append("Current user request:\n" + current_prompt)
+    return "\n\n".join(sections)
 
 
 def update_local_task(task_id, payload, filters=None):
@@ -1188,20 +1323,56 @@ def _notify_sse_clients(task_id: str, data: dict):
     """Notify all SSE clients for a task with new data."""
     global _task_stream_queues
     with _task_stream_lock:
-        queue = _task_stream_queues.get(task_id)
-        if queue:
-            try:
-                # Use asyncio.run_coroutine_threadsafe if we're in a thread context
-                loop = asyncio.new_event_loop()
-                try:
-                    asyncio.set_event_loop(loop)
-                    # Put the data in the queue - non-blocking
-                    if not queue.full():
-                        queue.put_nowait(data)
-                finally:
-                    loop.close()
-            except Exception:
-                pass
+        entry = _task_stream_queues.get(task_id)
+    if not isinstance(entry, dict):
+        return
+    queue = entry.get("queue")
+    loop = entry.get("loop")
+    if not queue or not loop:
+        return
+    try:
+        loop.call_soon_threadsafe(_enqueue_sse_event, queue, data)
+    except Exception:
+        pass
+
+
+def _enqueue_sse_event(queue_obj, data: dict):
+    try:
+        if not queue_obj.full():
+            queue_obj.put_nowait(data)
+    except Exception:
+        pass
+
+
+def _build_task_stream_bootstrap_event(task_id: str):
+    try:
+        if supabase:
+            task = select_one_with_schema_fallback(
+                "tasks",
+                ["id", "status", "result", "result_delta", "failure_reason"],
+                filters=[{"op": "eq", "col": "id", "val": task_id}],
+            )
+        else:
+            task = get_local_task_record(task_id)
+    except Exception:
+        task = None
+    if not isinstance(task, dict):
+        return None
+    status = str(task.get("status") or "").strip().lower()
+    result = str(task.get("result") or "")
+    delta = str(task.get("result_delta") or "")
+    failure_reason = str(task.get("failure_reason") or "").strip()
+    if status in {"completed"}:
+        return {"type": "complete", "status": "completed", "result": result}
+    if status in {"failed"}:
+        return {"type": "error", "status": "failed", "error": failure_reason or result or "local_ollama_failed"}
+    if status in {"cancelled"}:
+        return {"type": "status", "status": "cancelled"}
+    if status in {"processing", "claimed", "pending"}:
+        if delta:
+            return {"type": "delta", "status": status, "delta": delta}
+        return {"type": "status", "status": status, "delta": ""}
+    return None
 
 
 def run_local_ollama_task(task_id, prompt, model, deep_think, context):
@@ -1211,7 +1382,7 @@ def run_local_ollama_task(task_id, prompt, model, deep_think, context):
     # Create async queue for SSE streaming
     with _task_stream_lock:
         if task_id not in _task_stream_queues:
-            _task_stream_queues[task_id] = asyncio.Queue(maxsize=100)
+            _task_stream_queues[task_id] = {"queue": asyncio.Queue(maxsize=100), "loop": None}
     
     started_at = time.time()
     first_token_ms = None
@@ -1232,9 +1403,6 @@ def run_local_ollama_task(task_id, prompt, model, deep_think, context):
             ],
         )
         
-        # Give Supabase time to update, but don't block on read
-        time.sleep(0.05)
-        
         final_prompt = build_local_prompt(prompt, context, deep_think)
         
         prompt_len = len(final_prompt)
@@ -1244,6 +1412,7 @@ def run_local_ollama_task(task_id, prompt, model, deep_think, context):
             f"options={generation_options}"
         )
         full_result = ""
+        fallback_result = ""
         last_flush = 0.0
         last_supabase_flush = 0.0
         
@@ -1279,15 +1448,18 @@ def run_local_ollama_task(task_id, prompt, model, deep_think, context):
                     payload = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                token = payload.get("response") or ""
-                if token:
-                    full_result += token
+                thinking_text, answer_text = extract_local_generate_texts(payload)
+                stream_text = answer_text
+                if stream_text:
+                    full_result += stream_text
                     if first_token_ms is None:
                         first_token_ms = max(1, int((time.time() - started_at) * 1000))
+                elif not deep_think and thinking_text:
+                    fallback_result += thinking_text
                 now = time.time()
                 
                 # SSE streaming - frequent updates to frontend (every 100ms)
-                if token and (now - last_flush >= 0.1):
+                if stream_text and (now - last_flush >= 0.1):
                     _notify_sse_clients(task_id, {"type": "delta", "delta": full_result})
                     last_flush = now
                     
@@ -1298,11 +1470,27 @@ def run_local_ollama_task(task_id, prompt, model, deep_think, context):
         if get_task_status(task_id) == "cancelled":
             _notify_sse_clients(task_id, {"type": "status", "status": "cancelled"})
             return
+
+        if not full_result.strip() and fallback_result.strip():
+            logger.info("local ollama recovered answer from thinking stream for %s", task_id)
+            full_result = fallback_result
+            if first_token_ms is None:
+                first_token_ms = max(1, int((time.time() - started_at) * 1000))
             
+        if not full_result.strip():
+            logger.warning("local ollama stream returned empty output for %s; retrying one-shot generate", task_id)
+            retry_result = local_ollama_generate_once(model, final_prompt, generation_options, deep_think=deep_think)
+            if retry_result.strip():
+                full_result = retry_result
+                if first_token_ms is None:
+                    first_token_ms = max(1, int((time.time() - started_at) * 1000))
+            else:
+                raise RuntimeError("local_ollama_empty_response")
+
         print(f"[DEBUG] Model: {model}, Raw output length: {len(full_result)}, Preview: {full_result[:200]}...")
         final_result = normalize_model_output(full_result, deep_think)
         print(f"[DEBUG] Normalized result: {final_result[:200]}...")
-        if not deep_think and not is_valid_standard_answer(final_result):
+        if not deep_think and full_result.strip() and not is_valid_standard_answer(final_result):
             answer = extract_tag_content(final_result, "answer") or re.sub(r"</?(?:think|answer)>", "", final_result, flags=re.IGNORECASE).strip()
             print(f"[DEBUG] Answer validation failed - answer: '{answer[:100]}...', looks_like_reasoning_leak: {looks_like_reasoning_leak(answer)}, len: {len(answer)}")
             print(f"[DEBUG] Attempting repair...")
@@ -1310,9 +1498,6 @@ def run_local_ollama_task(task_id, prompt, model, deep_think, context):
             final_result = normalize_model_output(final_result, False)
             print(f"[DEBUG] Repaired result: {final_result[:200]}...")
         
-        # Notify completion via SSE
-        _notify_sse_clients(task_id, {"type": "complete", "status": "completed", "result": final_result})
-
         next_context = build_billing_context_on_settle(
             context,
             next_state="local_completed",
@@ -1321,6 +1506,20 @@ def run_local_ollama_task(task_id, prompt, model, deep_think, context):
         if first_token_ms is not None:
             metrics["first_token_ms"] = float(first_token_ms)
             next_context["metrics"] = metrics
+        elapsed_ms = max(1, int((time.time() - started_at) * 1000))
+
+        # Notify completion via SSE with timing metadata so the desktop UI does
+        # not depend on a follow-up poll to render elapsed / first-token values.
+        _notify_sse_clients(
+            task_id,
+            {
+                "type": "complete",
+                "status": "completed",
+                "result": final_result,
+                "elapsed_ms": elapsed_ms,
+                "first_token_ms": first_token_ms if first_token_ms is not None else elapsed_ms,
+            },
+        )
 
         # Write final result to Supabase (not every token)
         update_local_task(
@@ -1340,7 +1539,8 @@ def run_local_ollama_task(task_id, prompt, model, deep_think, context):
     except Exception as e:
         logger.warning("local ollama task failed for %s: %s", task_id, e)
         failure_reason = str(e or "local_ollama_failed").strip()[:240] or "local_ollama_failed"
-        _notify_sse_clients(task_id, {"type": "error", "error": failure_reason})
+        elapsed_ms = max(1, int((time.time() - started_at) * 1000))
+        _notify_sse_clients(task_id, {"type": "error", "error": failure_reason, "elapsed_ms": elapsed_ms, "first_token_ms": first_token_ms or 0})
 
         # Important:
         # Do NOT silently fall back to remote when local execution fails.
@@ -2041,6 +2241,10 @@ def derive_model_capability(vram_gb):
 
 def get_local_gpu_vram_gb():
     """Get local GPU VRAM in GB using nvidia-smi or wmi."""
+    now = time.time()
+    with _local_gpu_vram_lock:
+        if _local_gpu_vram_cache["expires_at"] > now:
+            return float(_local_gpu_vram_cache["value"] or 0)
     vram_gb = 0
     gpu_count = 1
     try:
@@ -2072,6 +2276,9 @@ def get_local_gpu_vram_gb():
             pass
     except Exception:
         vram_gb = 4.0  # Default fallback
+    with _local_gpu_vram_lock:
+        _local_gpu_vram_cache["value"] = float(vram_gb or 0)
+        _local_gpu_vram_cache["expires_at"] = now + 60.0
     return vram_gb
 
 
@@ -3415,12 +3622,16 @@ def get_task(task_id: str, request: Request):
                 task["result"] = f"<answer>{fallback}</answer>" if fallback else "<answer>回答格式异常，请重新生成。</answer>"
             raw_delta = str(task.get("result_delta") or "")
             if raw_delta:
-                delta_normalized = normalize_model_output(raw_delta, False)
-                if is_valid_standard_answer(delta_normalized):
-                    task["result_delta"] = delta_normalized
+                task_status = str(task.get("status") or "").lower()
+                if task_status in ACTIVE_TASK_STATUSES:
+                    task["result_delta"] = normalize_partial_model_output(raw_delta, False)
                 else:
-                    fallback_delta = extract_fallback_answer_from_leak(raw_delta)
-                    task["result_delta"] = f"<answer>{fallback_delta}</answer>" if fallback_delta else ""
+                    delta_normalized = normalize_model_output(raw_delta, False)
+                    if is_valid_standard_answer(delta_normalized):
+                        task["result_delta"] = delta_normalized
+                    else:
+                        fallback_delta = extract_fallback_answer_from_leak(raw_delta)
+                        task["result_delta"] = f"<answer>{fallback_delta}</answer>" if fallback_delta else ""
         if str(task.get("status") or "").lower() == "failed" and not task.get("failure_reason"):
             task["failure_reason"] = "unknown_failure"
         return {"status": "success", "task": task}
@@ -3433,10 +3644,16 @@ async def _task_stream_generator(task_id: str):
     global _task_stream_queues
     
     # Get or create queue for this task
+    loop = asyncio.get_running_loop()
     with _task_stream_lock:
         if task_id not in _task_stream_queues:
-            _task_stream_queues[task_id] = asyncio.Queue(maxsize=100)
-        queue = _task_stream_queues[task_id]
+            _task_stream_queues[task_id] = {"queue": asyncio.Queue(maxsize=100), "loop": loop}
+        entry = _task_stream_queues[task_id]
+        entry["loop"] = loop
+        queue = entry["queue"]
+    bootstrap_event = _build_task_stream_bootstrap_event(task_id)
+    if bootstrap_event is not None:
+        _enqueue_sse_event(queue, bootstrap_event)
     
     try:
         while True:

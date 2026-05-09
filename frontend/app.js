@@ -719,6 +719,41 @@ function getInitialPage() {
   return "chat";
 }
 
+function clearSupabaseStoredSessionTokens() {
+  try {
+    const keys = [];
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = String(localStorage.key(index) || "");
+      if (!key) continue;
+      if (/^sb-.*-auth-token$/i.test(key) || key.includes("supabase.auth.token")) {
+        keys.push(key);
+      }
+    }
+    keys.forEach((key) => {
+      try {
+        localStorage.removeItem(key);
+      } catch {}
+    });
+  } catch {}
+  try {
+    if (window.sessionStorage) {
+      const keys = [];
+      for (let index = 0; index < window.sessionStorage.length; index += 1) {
+        const key = String(window.sessionStorage.key(index) || "");
+        if (!key) continue;
+        if (/^sb-.*-auth-token$/i.test(key) || key.includes("supabase.auth.token")) {
+          keys.push(key);
+        }
+      }
+      keys.forEach((key) => {
+        try {
+          window.sessionStorage.removeItem(key);
+        } catch {}
+      });
+    }
+  } catch {}
+}
+
 function getWorkerName() {
   try {
     const existing = localStorage.getItem(WORKER_KEY);
@@ -752,7 +787,13 @@ function createSupabaseClient() {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
   if (!window.supabase || typeof window.supabase.createClient !== "function") return null;
   try {
-    return window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    return window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+    });
   } catch {
     return null;
   }
@@ -911,6 +952,10 @@ function getApiErrorMessage(payload, fallback = "Request failed. Please retry.",
   return rawMessage || fallback;
 }
 
+function isNotFoundApiPayload(payload) {
+  return String(payload?.code || "").trim() === "not_found";
+}
+
 function getMessageAnswerText(message) {
   if (!message || message.role !== "assistant") return "";
   const parsed = parseReasoningContent(message.content || "");
@@ -950,6 +995,39 @@ function createChatSession(title = "New chat") {
   };
 }
 
+function isInvalidAssistantMessageForRestore(message) {
+  if (!message || message.role !== "assistant") return false;
+  if (String(message.status || "").toLowerCase() !== "completed") return true;
+  const parsed = parseReasoningContent(message.content || "");
+  const content = String(parsed.answer || message.content || "")
+    .replace(/<\/?(?:think|answer)>/gi, "")
+    .trim();
+  const normalized = content.replace(/\\n/g, "\n").trim().toLowerCase();
+  if (
+    !content ||
+    normalized === "your answer here" ||
+    normalized === "write the final answer only." ||
+    normalized === "final answer only." ||
+    (/^[`'".,;:!?()\[\]{}<>\-_/\\|&+\s]+$/.test(content) && !/[\u4e00-\u9fffA-Za-z0-9]/.test(content))
+  ) {
+    return true;
+  }
+  if (looksLikeReasoningLeak(content) && !parsed.answer) {
+    return true;
+  }
+  return false;
+}
+
+function sanitizeLoadedMessages(messages) {
+  return Array.isArray(messages)
+    ? messages.filter((item) => {
+        if (!item || !["user", "assistant"].includes(item.role)) return false;
+        if (item.role === "assistant" && isInvalidAssistantMessageForRestore(item)) return false;
+        return Boolean(String(item.content || "").trim());
+      })
+    : [];
+}
+
 function getInitialChatState() {
   try {
     const raw = localStorage.getItem(CHAT_SESSIONS_KEY);
@@ -958,7 +1036,11 @@ function getInitialChatState() {
     const sessions = Array.isArray(parsed)
       ? parsed
           .filter((item) => item && item.id && Array.isArray(item.messages))
-          .map((item) => ({ ...item, pinned: Boolean(item.pinned) }))
+          .map((item) => ({
+            ...item,
+            pinned: Boolean(item.pinned),
+            messages: sanitizeLoadedMessages(item.messages),
+          }))
       : [];
     if (sessions.length > 0) {
       const active = sessions.find((item) => item.id === current) || sessions[0];
@@ -1003,7 +1085,9 @@ function buildConversationHistory(messages) {
   return messages
     .filter((item) => {
       if (!item || !["user", "assistant"].includes(item.role)) return false;
-      if (item.role === "assistant" && item.status === "failed") return false;
+      if (item.role === "assistant") {
+        if (String(item.status || "").toLowerCase() !== "completed") return false;
+      }
       return Boolean(String(item.content || "").trim());
     })
     .slice(-MAX_CONTEXT_MESSAGES)
@@ -1019,6 +1103,18 @@ function buildConversationHistory(messages) {
       let content = String(rawContent || "")
         .replace(/<\/?(?:think|answer)>/gi, "")
         .trim();
+      if (item.role === "assistant") {
+        const normalized = content.replace(/\\n/g, "\n").trim().toLowerCase();
+        if (
+          !content ||
+          normalized === "your answer here" ||
+          normalized === "write the final answer only." ||
+          normalized === "final answer only." ||
+          (/^[`'".,;:!?()\[\]{}<>\-_/\\|&+\s]+$/.test(content) && !/[\u4e00-\u9fffA-Za-z0-9]/.test(content))
+        ) {
+          return null;
+        }
+      }
       if (content.length > MAX_CONTEXT_CONTENT_CHARS) {
         content = `${content.slice(0, MAX_CONTEXT_CONTENT_CHARS).trim()}\n...(truncated)`;
       }
@@ -2209,21 +2305,21 @@ function LoginGate({
         <p className="mb-5 text-sm text-zinc-400">{configMissing ? t("login_missing_cfg") : t("login_subtitle")}</p>
         {error ? <div className="mb-4 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">{t("login_error_prefix", { error })}</div> : null}
         <div className="grid gap-3">
-          <button disabled={loading || configMissing} onClick={onGoogle} className="h-11 rounded-xl border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_google")}</button>
-          <button disabled={loading || configMissing} onClick={onGithub} className="h-11 rounded-xl border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_github")}</button>
+          <button type="button" disabled={loading || configMissing} onClick={onGoogle} className="h-11 rounded-xl border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_google")}</button>
+          <button type="button" disabled={loading || configMissing} onClick={onGithub} className="h-11 rounded-xl border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_github")}</button>
         </div>
         <div className="my-5 h-px bg-line" />
         <div className="grid gap-3">
           <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder={t("login_email_label")} className="h-11 rounded-xl border border-line bg-transparent px-3 text-sm outline-none" />
           <div className="grid grid-cols-2 gap-2">
-            <button disabled={loading || configMissing || !email.trim()} onClick={onSendEmailOtp} className="h-10 rounded-lg border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_send_email")}</button>
-            <button disabled={loading || configMissing || !email.trim() || !otp.trim()} onClick={onVerifyEmailOtp} className="h-10 rounded-lg border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_verify_email")}</button>
+            <button type="button" disabled={loading || configMissing || !email.trim()} onClick={onSendEmailOtp} className="h-10 rounded-lg border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_send_email")}</button>
+            <button type="button" disabled={loading || configMissing || !email.trim() || !otp.trim()} onClick={onVerifyEmailOtp} className="h-10 rounded-lg border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_verify_email")}</button>
           </div>
           <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder={t("login_phone_label")} className="h-11 rounded-xl border border-line bg-transparent px-3 text-sm outline-none" />
           <input value={otp} onChange={(e) => setOtp(e.target.value)} placeholder={t("login_otp_label")} className="h-11 rounded-xl border border-line bg-transparent px-3 text-sm outline-none" />
           <div className="grid grid-cols-2 gap-2">
-            <button disabled={loading || configMissing || !phone.trim()} onClick={onSendPhoneOtp} className="h-10 rounded-lg border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_send_phone")}</button>
-            <button disabled={loading || configMissing || !phone.trim() || !otp.trim()} onClick={onVerifyPhoneOtp} className="h-10 rounded-lg border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_verify_phone")}</button>
+            <button type="button" disabled={loading || configMissing || !phone.trim()} onClick={onSendPhoneOtp} className="h-10 rounded-lg border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_send_phone")}</button>
+            <button type="button" disabled={loading || configMissing || !phone.trim() || !otp.trim()} onClick={onVerifyPhoneOtp} className="h-10 rounded-lg border border-line text-sm hover:bg-zinc-900/60 disabled:opacity-40">{t("login_verify_phone")}</button>
           </div>
         </div>
       </div>
@@ -2471,14 +2567,6 @@ function App() {
     }
     authSyncTokenRef.current = token;
     authSyncPromiseRef.current = (async () => {
-      if (supabaseClient?.auth?.setSession && refresh) {
-        try {
-          await supabaseClient.auth.setSession({
-            access_token: token,
-            refresh_token: refresh,
-          });
-        } catch {}
-      }
       return await exchangeSupabaseSession(token);
     })();
     try {
@@ -2500,19 +2588,12 @@ function App() {
         nextUserId = String(data?.user?.id || "").trim();
       } catch {}
     }
-    if (supabaseClient?.auth?.setSession && refresh) {
-      try {
-        await supabaseClient.auth.setSession({
-          access_token: token,
-          refresh_token: refresh,
-        });
-      } catch {}
-    }
     try {
       if (nextUserId) localStorage.setItem(USER_KEY, nextUserId);
       localStorage.setItem(AUTH_TOKEN_KEY, token);
     } catch {}
     storeSupabaseSessionTokens(token, refresh);
+    clearSupabaseStoredSessionTokens();
     setAuthToken(token);
     setIsLoggedIn(true);
     appendAuthDebugLog("acceptSupabaseTokenLogin.fallback", nextUserId || "no-user-id");
@@ -2538,6 +2619,7 @@ function App() {
       localStorage.setItem(USER_KEY, nextUserId);
       localStorage.setItem(AUTH_TOKEN_KEY, nextToken);
     } catch {}
+    clearSupabaseStoredSessionTokens();
     setAuthToken(nextToken);
     setCredits(Number(payload?.credits?.available || 0));
     setIsLoggedIn(true);
@@ -2632,6 +2714,21 @@ function App() {
     return true;
   };
 
+  const hasPersistentGatewaySession = () => {
+    try {
+      if (String(authToken || "").trim()) return true;
+      if (String(localStorage.getItem(AUTH_TOKEN_KEY) || "").trim()) return true;
+    } catch {}
+    return false;
+  };
+
+  useEffect(() => {
+    if (isLoggedIn) return;
+    if (!hasPersistentGatewaySession()) return;
+    appendAuthDebugLog("auth.restore_from_persistent_token");
+    preserveStoredGatewaySession();
+  }, [isLoggedIn, authToken]);
+
   const refreshCredits = async (token = authToken) => {
     const validated = await validateGatewaySessionToken(token);
     if (validated.ok) return true;
@@ -2702,9 +2799,7 @@ function App() {
         }
         if (!supabaseClient) {
           setLoginError(t("login_missing_cfg"));
-          if (!preserveStoredGatewaySession()) {
-            setIsLoggedIn(false);
-          }
+          preserveStoredGatewaySession();
           if (!cancelled) setAuthReady(true);
           return;
         }
@@ -2712,40 +2807,38 @@ function App() {
           try {
             const { error: exchangeErr } = await supabaseClient.auth.exchangeCodeForSession(window.location.href);
             if (exchangeErr) throw exchangeErr;
+            const { data } = await supabaseClient.auth.getSession();
+            const accessToken = data?.session?.access_token || "";
+            if (accessToken) {
+              try {
+                await syncGatewaySession(accessToken, data?.session?.refresh_token || "");
+              } catch {
+                appendAuthDebugLog("bootstrap.code_exchange_failed");
+                await acceptSupabaseTokenLogin(
+                  accessToken,
+                  data?.session?.user?.id || "",
+                  data?.session?.refresh_token || ""
+                );
+              }
+            }
+            clearSupabaseStoredSessionTokens();
             window.history.replaceState(null, "", window.location.pathname + "#chat");
+            if (!cancelled) setAuthReady(true);
+            return;
           } catch (exchangeError) {
             setLoginError(String(exchangeError?.message || exchangeError));
           }
         }
-        const { data, error } = await supabaseClient.auth.getSession();
-        if (error) throw error;
-        const accessToken = data?.session?.access_token || "";
-        if (accessToken) {
-          try {
-            await syncGatewaySession(accessToken, data?.session?.refresh_token || "");
-          } catch {
-            appendAuthDebugLog("bootstrap.session_exchange_failed");
-            await acceptSupabaseTokenLogin(
-              accessToken,
-              data?.session?.user?.id || "",
-              data?.session?.refresh_token || ""
-            );
-          }
-        } else {
-          const recovered = await keepGatewaySessionIfPossible();
-          if (!recovered) {
-            preserveStoredGatewaySession();
-          }
+        const recovered = await keepGatewaySessionIfPossible();
+        if (!recovered) {
+          preserveStoredGatewaySession();
         }
       } catch (error) {
         if (!cancelled) {
           appendAuthDebugLog("bootstrap.error", String(error?.message || error));
           const recovered = await keepGatewaySessionIfPossible();
-          if (!recovered) {
-            if (!preserveStoredGatewaySession()) {
-              setIsLoggedIn(false);
-              setLoginError(String(error?.message || error));
-            }
+          if (!recovered && !preserveStoredGatewaySession()) {
+            setLoginError(String(error?.message || error));
           }
         }
       } finally {
@@ -2755,62 +2848,6 @@ function App() {
     bootstrapAuth();
     return () => {
       cancelled = true;
-    };
-  }, [supabaseClient]);
-
-  useEffect(() => {
-    if (!supabaseClient) return undefined;
-    const { data } = supabaseClient.auth.onAuthStateChange(async (evt, session) => {
-      appendAuthDebugLog("supabase.auth_event", evt);
-      if (evt === "INITIAL_SESSION") return;
-      if (evt === "SIGNED_OUT" && !explicitSignOutRef.current) {
-        const recovered = await keepGatewaySessionIfPossible();
-        if (recovered) {
-          appendAuthDebugLog("supabase.signed_out.recovered");
-          return;
-        }
-        if (preserveStoredGatewaySession()) {
-          appendAuthDebugLog("supabase.signed_out.preserved");
-          return;
-        }
-      }
-      const nextAccessToken = session?.access_token || "";
-      if (!nextAccessToken) {
-        const recovered = await keepGatewaySessionIfPossible();
-        if (recovered) {
-          appendAuthDebugLog("supabase.empty_session.recovered");
-          return;
-        }
-        if (preserveStoredGatewaySession()) {
-          appendAuthDebugLog("supabase.empty_session.preserved");
-          return;
-        }
-        appendAuthDebugLog("supabase.empty_session.ignored");
-        return;
-      }
-      try {
-        try {
-          await syncGatewaySession(nextAccessToken, session?.refresh_token || "");
-        } catch {
-          appendAuthDebugLog("supabase.session_exchange_failed");
-          await acceptSupabaseTokenLogin(
-            nextAccessToken,
-            session?.user?.id || "",
-            session?.refresh_token || ""
-          );
-          return;
-        }
-        setLoginError("");
-        setIsLoggedIn(true);
-        appendAuthDebugLog("supabase.auth_event.applied", evt);
-        jumpToChatAfterLogin();
-      } catch (e) {
-        appendAuthDebugLog("supabase.auth_event.error", String(e?.message || e));
-        setLoginError(String(e?.message || e));
-      }
-    });
-    return () => {
-      data?.subscription?.unsubscribe?.();
     };
   }, [supabaseClient]);
 
@@ -2973,16 +3010,19 @@ function App() {
         const localMinePromise = localMinerName
           ? securedGet(`${API_BASE}/orders/mine?miner_name=${encodeURIComponent(localMinerName)}&limit=200`)
           : Promise.resolve(null);
+        const profilePromise = resolvedMinerName
+          ? securedGet(`${API_BASE}/orders/profile?${profileQuery.toString()}`)
+          : Promise.resolve(null);
         const [availableResponse, mineResponse, profileResponse, metricsResponse] = await Promise.all([
           securedGet(`${API_BASE}/orders?status=pending&source=frontend&limit=30`),
           securedGet(`${API_BASE}/orders/mine?miner_name=${encodeURIComponent(resolvedMinerName || workerName)}&limit=200`),
-          securedGet(`${API_BASE}/orders/profile?${profileQuery.toString()}`),
+          profilePromise,
           securedGet(`${API_BASE}/dashboard/metrics?limit=500`),
         ]);
         const [availablePayload, minePayload, profilePayload, metricsPayload] = await Promise.all([
           availableResponse.json(),
           mineResponse.json(),
-          profileResponse.json(),
+          profileResponse ? profileResponse.json() : Promise.resolve(null),
           metricsResponse.json(),
         ]);
         const localMineResponse = await localMinePromise;
@@ -2990,27 +3030,32 @@ function App() {
         if (!availableResponse.ok || availablePayload?.status !== "success") {
           throw new Error(getApiErrorMessage(availablePayload, "接单列表加载失败", lang));
         }
-        if (!mineResponse.ok || minePayload?.status !== "success") {
+        const mineNotFound = isNotFoundApiPayload(minePayload);
+        if ((!mineResponse.ok || minePayload?.status !== "success") && !mineNotFound) {
           throw new Error(getApiErrorMessage(minePayload, "我的接单列表加载失败", lang));
         }
-        if (!profileResponse.ok || profilePayload?.status !== "success") {
-          throw new Error(getApiErrorMessage(profilePayload, "矿工信息加载失败", lang));
-        }
-        if (!metricsResponse.ok || metricsPayload?.status !== "success") {
-          throw new Error(getApiErrorMessage(metricsPayload, "统计数据加载失败", lang));
-        }
-        if (localMineResponse && (!localMineResponse.ok || localMinePayload?.status !== "success")) {
-          throw new Error(getApiErrorMessage(localMinePayload, "本机接单列表加载失败", lang));
-        }
+        const softProfileError =
+          profileResponse && !isNotFoundApiPayload(profilePayload) && (!profileResponse.ok || profilePayload?.status !== "success")
+            ? getApiErrorMessage(profilePayload, "矿工信息加载失败", lang)
+            : "";
+        const softLocalMineError =
+          localMineResponse && !isNotFoundApiPayload(localMinePayload) && (!localMineResponse.ok || localMinePayload?.status !== "success")
+            ? getApiErrorMessage(localMinePayload, "本机接单列表加载失败", lang)
+            : "";
+        const softMetricsError =
+          !isNotFoundApiPayload(metricsPayload) && (!metricsResponse.ok || metricsPayload?.status !== "success")
+            ? getApiErrorMessage(metricsPayload, "统计数据加载失败", lang)
+            : "";
         if (!cancelled) {
           applyOrdersSnapshot({
             available_orders: availablePayload.orders || [],
-            my_orders: minePayload.orders || [],
-            my_orders_summary: minePayload.summary || null,
-            local_mine_orders: localMinePayload?.orders || [],
-            profile: profilePayload.profile || null,
-            metrics: metricsPayload.metrics || null,
+            my_orders: mineNotFound ? [] : (minePayload.orders || []),
+            my_orders_summary: mineNotFound ? null : (minePayload.summary || null),
+            local_mine_orders: softLocalMineError ? [] : (localMinePayload?.orders || []),
+            profile: softProfileError ? null : (profilePayload?.profile || null),
+            metrics: softMetricsError ? null : (metricsPayload?.metrics || null),
           });
+          setOrdersError(softProfileError || softLocalMineError || softMetricsError || "");
         }
       } catch (error) {
         if (!cancelled) {
@@ -3056,6 +3101,7 @@ function App() {
         const payload = JSON.parse(String(event.data || "{}"));
         if (payload?.status === "success" && payload?.snapshot) {
           applyOrdersSnapshot(payload.snapshot);
+          setOrdersError("");
         }
       } catch (error) {
         console.error("orders snapshot parse failed", error);
@@ -3206,11 +3252,9 @@ function App() {
     pollersRef.current.set(assistantId, timer);
   };
 
-  const connectSSE = (assistantId, taskId) => {
-    // Check if task is local execution mode by checking current message metadata
-    const message = messages.find((m) => m.id === assistantId);
-    const isLocal = message?.meta?.exec === "Local" || message?.meta?.node === "local-ollama";
-    
+  const connectSSE = (assistantId, taskId, options = {}) => {
+    const isLocal = Boolean(options?.isLocal);
+
     // Only use SSE for local tasks
     if (!isLocal) {
       schedulePoll(assistantId, taskId, 500);
@@ -3219,7 +3263,10 @@ function App() {
 
     let eventSource = null;
     try {
-      const url = `${API_BASE}/task/${taskId}/stream`;
+      const streamQuery = new URLSearchParams();
+      const authToken = String(localStorage.getItem(AUTH_TOKEN_KEY) || "").trim();
+      if (authToken) streamQuery.set("auth_token", authToken);
+      const url = `${API_BASE}/task/${taskId}/stream${streamQuery.toString() ? `?${streamQuery.toString()}` : ""}`;
       eventSource = new EventSource(url);
       
       eventSource.onmessage = (event) => {
@@ -3254,21 +3301,27 @@ function App() {
             setMessages((prev) =>
               prev.map((item) => {
                 if (item.id !== assistantId) return item;
-                const previousDelta = item.meta.lastDelta || "";
                 let firstTokenMs = item.meta.firstTokenMs || 0;
                 if (!firstTokenMs) {
-                  firstTokenMs = 1;
+                  firstTokenMs = item.meta.createdAtMs
+                    ? Math.max(1, Date.now() - item.meta.createdAtMs)
+                    : 1;
                 }
+                const elapsedMs = item.meta.createdAtMs
+                  ? Math.max(firstTokenMs, Date.now() - item.meta.createdAtMs)
+                  : Math.max(item.meta.elapsedMs || 0, firstTokenMs);
                 return {
                   ...item,
                   content: delta,
-                  meta: {
-                    ...item.meta,
-                    lastDelta: delta,
-                    firstTokenMs,
-                    hadStreamDelta: true,
-                  },
-                };
+                    meta: {
+                      ...item.meta,
+                      lastDelta: delta,
+                      elapsedMs,
+                      firstTokenMs,
+                      hadStreamDelta: true,
+                      localSlowWarningShown: false,
+                    },
+                  };
               })
             );
           } else if (type === "complete") {
@@ -3279,6 +3332,7 @@ function App() {
               eventSource = null;
             }
             const result = data.result || "";
+            const completedAtMs = Date.now();
             setMessages((prev) =>
               prev.map((item) =>
                 item.id === assistantId
@@ -3288,7 +3342,23 @@ function App() {
                       content: result,
                       meta: {
                         ...item.meta,
+                        elapsedMs:
+                          Number(data.elapsed_ms || 0) > 0
+                            ? Number(data.elapsed_ms || 0)
+                            : item.meta.createdAtMs
+                              ? Math.max(1, completedAtMs - item.meta.createdAtMs)
+                              : item.meta.elapsedMs,
+                        firstTokenMs:
+                          Number(data.first_token_ms || 0) > 0
+                            ? Number(data.first_token_ms || 0)
+                            : item.meta.firstTokenMs > 0
+                              ? item.meta.firstTokenMs
+                              : item.meta.createdAtMs
+                                ? Math.max(1, completedAtMs - item.meta.createdAtMs)
+                                : 1,
                         lastDelta: result,
+                        hadStreamDelta: true,
+                        localSlowWarningShown: false,
                       },
                     }
                   : item
@@ -3370,9 +3440,23 @@ function App() {
         if (taskStatus === "completed") {
           nextContent = result || nextContent;
           if (!firstTokenMs && nextContent) {
-            firstTokenMs = diffMs(createdAt, completedAt || createdAt) || 1;
+            firstTokenMs =
+              item.meta.firstTokenMs ||
+              diffMs(createdAt, completedAt || createdAt) ||
+              (item.meta.createdAtMs ? Math.max(1, Date.now() - item.meta.createdAtMs) : 1);
           }
         }
+
+        const completedElapsedMs =
+          taskStatus === "completed"
+            ? Math.max(
+                diffMs(createdAt, completedAt) || 0,
+                Number(item.meta.elapsedMs || 0),
+                item.meta.createdAtMs && (nextContent || hadStreamDelta)
+                  ? Math.max(1, Date.now() - item.meta.createdAtMs)
+                  : 0
+              )
+            : 0;
 
         const parsed = parseReasoningContent(nextContent);
         const nextExec =
@@ -3400,7 +3484,7 @@ function App() {
             exec: nextExec,
             elapsedMs:
               taskStatus === "completed"
-                ? diffMs(createdAt, completedAt) || item.meta.elapsedMs
+                ? completedElapsedMs
                 : Math.max(item.meta.elapsedMs, createdAt ? Date.now() - parseMs(createdAt) : 0),
             firstTokenMs,
             credits: (() => {
@@ -3458,28 +3542,25 @@ function App() {
         firstTokenMs <= 0 &&
         elapsedMs >= localNoTokenTimeoutMs
       ) {
-        stopPolling(assistantId);
         setMessages((prev) =>
           prev.map((item) =>
             item.id === assistantId
               ? {
                   ...item,
-                  status: "failed",
                   content:
                     item.content ||
-                    `本地推理超时：${localNoTokenTimeoutSeconds} 秒未收到首 token，请检查本地模型与 Ollama 状态后重试。`,
+                    `本地推理较慢：${localNoTokenTimeoutSeconds} 秒仍未收到首 token，继续等待本地模型返回。`,
                   meta: {
                     ...item.meta,
                     credits: 0,
                     billingState: String(taskBilling.state || ""),
+                    localSlowWarningShown: true,
                   },
                 }
               : item
           )
         );
-        setStreaming(false);
-        setActiveAssistantId((current) => (current === assistantId ? null : current));
-        refreshCredits();
+        schedulePoll(assistantId, taskId, 1200);
         return;
       }
       if (taskStatus === "completed") {
@@ -3653,7 +3734,9 @@ function App() {
         )
       );
 
-      connectSSE(assistantId, taskId);
+      connectSSE(assistantId, taskId, {
+        isLocal: String(createdTask.execution_mode || "").toLowerCase() === "local",
+      });
     } catch (error) {
       if (error?.name === "AbortError") {
         setMessages((prev) =>
@@ -3732,6 +3815,7 @@ function App() {
           deepThink,
           elapsedMs: 0,
           firstTokenMs: 0,
+          createdAtMs: Date.now(),
           credits: 0,
           taskId: localTaskId,
           node: normalizeMode(mode) === "local" ? "localhost" : "pending",
@@ -4126,6 +4210,7 @@ function App() {
         localStorage.removeItem(AUTH_TOKEN_KEY);
       } catch {}
       storeSupabaseSessionTokens("", "");
+      clearSupabaseStoredSessionTokens();
       explicitSignOutRef.current = false;
     }
   };
@@ -4138,7 +4223,9 @@ function App() {
     );
   }
 
-  if (authReady && !isLoggedIn && !hashBootstrapToken) {
+  const shouldShowLoginGate = authReady && !isLoggedIn && !hashBootstrapToken && !hasPersistentGatewaySession();
+
+  if (shouldShowLoginGate) {
     return (
       <LoginGate
         t={t}

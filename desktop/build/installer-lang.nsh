@@ -121,4 +121,7 @@ FunctionEnd
 !macro customUnInstall
   Delete "$INSTDIR\installer-language.txt"
   Delete "$INSTDIR\resources\runtime\ollama-install-mode.txt"
+  RMDir /r "$APPDATA\heph-desktop"
+  RMDir /r "$LOCALAPPDATA\heph"
+  RMDir /r "$LOCALAPPDATA\HEPH"
 !macroend

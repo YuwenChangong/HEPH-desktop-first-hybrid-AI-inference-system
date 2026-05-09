@@ -106,6 +106,7 @@ IMAGE_MAX_BYTES = 5 * 1024 * 1024
 STREAM_RESULT_DELTA_MAX_LEN = 12000
 GATEWAY_CONNECT_TIMEOUT = 5
 GATEWAY_READ_TIMEOUT = 25
+OLLAMA_READ_TIMEOUT_SECONDS = int(get_env("HEPH_OLLAMA_READ_TIMEOUT_SECONDS", "OLLAMA_READ_TIMEOUT_SECONDS") or "600")
 LOCAL_PROFILE_HOST = get_env("HEPH_LOCAL_PROFILE_HOST", "LOCAL_PROFILE_HOST") or "127.0.0.1"
 LOCAL_PROFILE_PORT = int(get_env("HEPH_LOCAL_PROFILE_PORT", "LOCAL_PROFILE_PORT") or "8765")
 AUTO_CLAIM_DEFAULT = str(get_env("HEPH_AUTO_CLAIM_DEFAULT", "AUTO_CLAIM_DEFAULT") or "0").strip().lower() in ("1", "true", "yes", "on")
@@ -553,7 +554,7 @@ def truncate_result_delta(result_delta: str) -> str:
     return result_delta
 
 
-def _execute_task_stream_update(task_id: str, result_text: str, status: str, result_delta: str = ""):
+def _execute_task_stream_update(task_id: str, result_text: str, status: str, result_delta: str = "", first_token_ms=None):
     if not supabase:
         return
     payload = {'status': status}
@@ -563,6 +564,21 @@ def _execute_task_stream_update(task_id: str, result_text: str, status: str, res
             payload['result_delta'] = ""
     if result_delta:
         payload['result_delta'] = truncate_result_delta(result_delta)
+    if first_token_ms is not None:
+        try:
+            task_row = supabase.table('tasks').select('context').eq('id', task_id).limit(1).execute()
+            task_context = {}
+            if task_row.data:
+                raw_context = task_row.data[0].get('context')
+                if isinstance(raw_context, dict):
+                    task_context = dict(raw_context)
+            metrics = task_context.get("metrics") if isinstance(task_context.get("metrics"), dict) else {}
+            if not metrics.get("first_token_ms"):
+                metrics["first_token_ms"] = float(first_token_ms)
+                task_context["metrics"] = metrics
+                payload["context"] = task_context
+        except Exception as e:
+            log(f"WARN failed to persist first_token_ms for task {task_id[:8]}: {e}")
     try:
         supabase.table('tasks').update(payload).eq('id', task_id).execute()
     except Exception as e:
@@ -580,9 +596,9 @@ def _execute_task_stream_update(task_id: str, result_text: str, status: str, res
 
 def _stream_update_loop():
     while True:
-        task_id, result_text, status, result_delta = stream_update_queue.get()
+        task_id, result_text, status, result_delta, first_token_ms = stream_update_queue.get()
         try:
-            _execute_task_stream_update(task_id, result_text, status, result_delta)
+            _execute_task_stream_update(task_id, result_text, status, result_delta, first_token_ms=first_token_ms)
         finally:
             stream_update_queue.task_done()
 
@@ -599,15 +615,15 @@ def start_stream_update_worker():
     stream_update_worker.start()
 
 
-def update_task_stream(task_id: str, result_text: str, status: str, result_delta: str = "", sync: bool = False):
+def update_task_stream(task_id: str, result_text: str, status: str, result_delta: str = "", sync: bool = False, first_token_ms=None):
     if not supabase:
         return
     result_delta = truncate_result_delta(result_delta)
     if sync:
-        _execute_task_stream_update(task_id, result_text, status, result_delta)
+        _execute_task_stream_update(task_id, result_text, status, result_delta, first_token_ms=first_token_ms)
         return
     try:
-        stream_update_queue.put_nowait((task_id, result_text, status, result_delta))
+        stream_update_queue.put_nowait((task_id, result_text, status, result_delta, first_token_ms))
     except queue.Full:
         log(f"WARN stream update queue full, skipped one delta update for task {task_id[:8]}")
 
@@ -722,7 +738,7 @@ def start_local_profile_server():
 def run_inference_with_retry(task: dict, task_id: str, retries: int = INFERENCE_RETRIES):
     for attempt in range(retries + 1):
         try:
-            result_text, token_count = run_inference_stream(task, task_id, attempt=attempt)
+            result_text, token_count, first_token_ms = run_inference_stream(task, task_id, attempt=attempt)
             if not result_text or not result_text.strip():
                 if bool(task.get("deep_think", False)):
                     raise MinerModelError("empty model response")
@@ -747,7 +763,7 @@ def run_inference_with_retry(task: dict, task_id: str, retries: int = INFERENCE_
                     token_count = max(token_count, repaired_tokens)
                 else:
                     result_text = normalized
-            return result_text, token_count
+            return result_text, token_count, first_token_ms
         except TaskCancelledError:
             raise
         except TimeoutError:
@@ -756,7 +772,7 @@ def run_inference_with_retry(task: dict, task_id: str, retries: int = INFERENCE_
             if attempt >= retries:
                 if not bool(task.get("deep_think", False)):
                     fallback = build_last_resort_standard_answer(task, str(e))
-                    return fallback, max(1, len(fallback))
+                    return fallback, max(1, len(fallback)), None
                 raise
             log(f"闂傚倸鍊搁崐鎼佸磹妞嬪海鐭嗗〒姘ｅ亾闁诡喖娼″畷鎯邦槷闁哄鐗犻弻锟犲炊閳轰焦鐎婚梺鎼炲妽濡啴骞冨Δ鍛棃婵炴垶鐟﹂崰鎰磽?闂傚倸鍊搁崐鎼佸磹瀹勬噴褰掑炊椤掑﹦绋忔繝銏ｆ硾椤戝洭銆呴幓鎹楀綊鎮╁顔煎壈缂備讲鍋撳鑸靛姇缁犺绻涢敐搴″濠德ゅ亹缁辨帡鎮╁畷鍥р吂闂佸疇顫夐崹鍧楀箖閳哄懎绠甸柟鐑樻尰椤斿嫮绱撻崒娆戭槮濠⒀冮叄瀹曟垿濡堕崪浣告闂佸壊鍋呭ú鏍煁閸ャ劊浜滈柟鏉跨仛缁舵岸鏌涢幋婊呯煓闁诡喛娉涢～婵嬵敇閻樼數鏉芥繝娈垮枛閿曘儱顪冩禒瀣祦闁归偊鍘介崕鐔兼煥濠靛棗鈧綊锝炲澶嬧拻濞达絿顭堥幃鎴炰繆閻愬弶鍋ョ€规洖婀遍幑鍕惞鐟欏嫭顔曢梻浣烘嚀婢у酣鎮洪弮鍫濇瀬鐎广儱妫涚粻楣冩煙鐎电鍓遍柣鎺旀櫕缁辨帡骞囬闂存濠殿喖锕ュ浠嬬嵁閺嶎厽鍊烽柟缁樺笒鑲栭梻鍌欑閹诧繝骞愭繝姘仭闁靛鏅涢悡婵堚偓骞垮劚椤︻垶锝為崨瀛樼厪闁割偅绻冮ˉ婊兠?({attempt + 1}/{retries + 1}): {e}")
             time.sleep(2)
@@ -1625,6 +1641,78 @@ def iter_stream_tokens(model: str, final_prompt: str, images, think_mode: bool, 
         yield "</answer>"
 
 
+def iter_stream_tokens_http(model: str, final_prompt: str, images, think_mode: bool, system_prompt: str, options):
+    payload = {
+        "model": model,
+        "prompt": final_prompt,
+        "stream": True,
+        "keep_alive": "30m",
+        "options": options,
+    }
+    if system_prompt:
+        payload["system"] = system_prompt
+    if images:
+        payload["images"] = images
+
+    thinking_started = False
+    thinking_closed = False
+    answer_started = False
+
+    with requests.post(
+        "http://127.0.0.1:11434/api/generate",
+        json=payload,
+        stream=True,
+        timeout=(5, OLLAMA_READ_TIMEOUT_SECONDS),
+    ) as response:
+        response.raise_for_status()
+        for raw_line in response.iter_lines():
+            line = raw_line.decode("utf-8", errors="ignore").strip() if isinstance(raw_line, bytes) else str(raw_line or "").strip()
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            token = str(chunk.get("response") or "")
+            if not token:
+                if chunk.get("done"):
+                    break
+                continue
+
+            if think_mode:
+                thinking_text, answer_text = extract_generate_texts({"response": token})
+                token_parts = []
+                if thinking_text.strip():
+                    if not thinking_started:
+                        token_parts.append("<think>")
+                        thinking_started = True
+                    token_parts.append(thinking_text)
+                if answer_text.strip():
+                    if thinking_started and not thinking_closed:
+                        token_parts.append("</think>")
+                        thinking_closed = True
+                    if not answer_started:
+                        token_parts.append("<answer>")
+                        answer_started = True
+                    token_parts.append(answer_text)
+                normalized_token = "".join(token_parts)
+                if normalized_token:
+                    yield normalized_token
+            else:
+                if not answer_started:
+                    yield "<answer>"
+                    answer_started = True
+                yield token
+
+            if chunk.get("done"):
+                break
+
+    if think_mode and thinking_started and not thinking_closed:
+        yield "</think>"
+    if answer_started:
+        yield "</answer>"
+
+
 def ollama_generate_once(model: str, final_prompt: str, images, think_mode: bool, system_prompt: str, options, context_state=None):
     kwargs = {
         "model": model,
@@ -1767,6 +1855,7 @@ def run_deep_think_stream(task: dict, task_id: str, model: str, attempt: int = 0
     answer_text = ""
     token_count = 0
     first_token_sent = False
+    first_token_ms = None
     last_update_time = time.time()
     update_interval = 0.08
     update_min_delta = 4
@@ -1780,8 +1869,10 @@ def run_deep_think_stream(task: dict, task_id: str, model: str, attempt: int = 0
         reasoning_text += token
         full_result = f"<think>{reasoning_text}"
         token_count += len(token)
+        if token and first_token_ms is None:
+            first_token_ms = max(1, int((time.time() - inference_start_time) * 1000))
         if not first_token_sent or (time.time() - last_update_time > update_interval and len(token) >= 1):
-            update_task_stream(task_id, "", 'processing', truncate_result_delta(full_result), sync=True)
+            update_task_stream(task_id, "", 'processing', truncate_result_delta(full_result), sync=True, first_token_ms=first_token_ms if not first_token_sent else None)
             first_token_sent = True
             last_update_time = time.time()
 
@@ -1814,7 +1905,7 @@ def run_deep_think_stream(task: dict, task_id: str, model: str, attempt: int = 0
     answer_text = strip_protocol_tags(answer_text)
     final_result = f"<think>{reasoning_text}</think><answer>{answer_text}</answer>"
     update_task_stream(task_id, "", 'processing', truncate_result_delta(final_result), sync=True)
-    return final_result, token_count
+    return final_result, token_count, first_token_ms
 
 
 def terminate_inference_process(process, task_id: str):
@@ -1843,13 +1934,15 @@ def run_inference_stream(task: dict, task_id: str, attempt: int = 0):
     # On Windows + constrained VRAM, streaming subprocess path can return empty output.
     # Allow forcing non-stream direct generation for stability.
     if FORCE_NON_STREAM:
-        return ollama_generate_with_continuation(
+        result_text, token_count = ollama_generate_with_continuation(
             model, final_prompt, images, think_mode, system_prompt, ollama_options, language_hint=language_hint
         )
+        return result_text, token_count, None
 
     full_result = ""
     token_count = 0
     first_token_sent = False
+    first_token_ms = None
     last_update_time = time.time()
     pending_delta = ""
     think_mode_update_interval = 0.08 if think_mode else STREAM_UPDATE_INTERVAL
@@ -1859,16 +1952,23 @@ def run_inference_stream(task: dict, task_id: str, attempt: int = 0):
 
     if os.name == "nt" and not FORCE_NON_STREAM:
         try:
-            for token in iter_stream_tokens(model, final_prompt, images, think_mode, system_prompt, ollama_options):
+            token_iterator = (
+                iter_stream_tokens_http(model, final_prompt, images, think_mode, system_prompt, ollama_options)
+                if not think_mode
+                else iter_stream_tokens(model, final_prompt, images, think_mode, system_prompt, ollama_options)
+            )
+            for token in token_iterator:
                 if time.time() - inference_start_time > MAX_TASK_RUNTIME:
                     raise TaskTimeoutError("inference timed out")
                 cancel_check_at = raise_if_task_cancelled(task_id, cancel_check_at)
                 full_result += token
                 pending_delta = truncate_result_delta(pending_delta + token)
                 token_count += len(token)
+                if token and first_token_ms is None:
+                    first_token_ms = max(1, int((time.time() - inference_start_time) * 1000))
 
                 if not first_token_sent:
-                    update_task_stream(task_id, "", 'processing', truncate_result_delta(full_result), sync=True)
+                    update_task_stream(task_id, "", 'processing', truncate_result_delta(full_result), sync=True, first_token_ms=first_token_ms)
                     first_token_sent = True
                     last_update_time = time.time()
                     pending_delta = ""
@@ -1896,7 +1996,7 @@ def run_inference_stream(task: dict, task_id: str, attempt: int = 0):
                 full_result = one_shot
                 token_count = max(token_count, fallback_token_count)
 
-        return full_result, token_count
+        return full_result, token_count, first_token_ms
 
     event_queue = MP_CONTEXT.Queue(maxsize=64)
     inference_process = MP_CONTEXT.Process(
@@ -1934,9 +2034,11 @@ def run_inference_stream(task: dict, task_id: str, attempt: int = 0):
             pending_delta = truncate_result_delta(pending_delta + token)
             if token:
                 token_count += len(token)
+                if first_token_ms is None:
+                    first_token_ms = max(1, int((time.time() - inference_start_time) * 1000))
 
             # 濠?token 缂傚倸鍊搁崐鎼佸磹閹间礁纾归柣鎴ｅГ閸婂潡鏌ㄩ弴鐐测偓鎼佹嫅閻斿吋鐓忓┑鐐靛亾濞呮捇鏌℃担绋款伃闁哄本绋戦埥澶愬础閻愯尙顔掗梻浣告惈濡酣宕愬┑瀣摕婵炴垯鍨归悞娲煕閹板吀绨存俊鎻掔墢缁辨挻鎷呴崫鍕戯絽鈹戦悙璇ц含鐎殿喖顭峰鎾偄閾忚鍟庨梻浣虹帛閸旓箓宕滃顒夌唵闁圭儤顨嗛埛鎴犵磼鐎ｎ偒鍎ラ柛搴㈠姍閺岀喎顫㈢仦钘夋優缂備緡鍣崣鍐箖閵忋倕浼犻柕澹懏顫岄梻鍌欑閹测€趁洪敃鍌氱煑閹肩补鍨鹃敐澶嬪€婚柤鎭掑劗閹峰姊虹粙鎸庢拱闁荤啙鍛濞寸厧鐡ㄩ悡鏇㈡煙閹屽殶闁瑰啿娲弻鐔碱敊閻偒浜崺鐐哄箣閻橆偄浜鹃柨婵嗙凹缁ㄥ鏌涚€ｎ亞效婵﹥妞藉Λ鍐ㄢ槈濮橆剦鏆俊鐐€х€靛矂宕瑰畷鍥у灊闁割偁鍎遍柋鍥煃閸ㄦ稒娅呭ù婊呭亾椤ㄣ儵鎮欓懠顑胯檸闂佸憡姊圭喊宥囨崲濞戙垹绾ч柟瀛樼妇閸嬫捇宕烽娑樹壕闂傚牊绋忛崑銏⑩偓瑙勬礃鐢繝骞冨▎鎴濆灊閻熸瑥瀚娲⒒閸屾瑧绐旈柍褜鍓涢崑娑㈡嚐椤栨稒娅犻悗娑欙供濞堜粙鏌ｉ幇顓熺稇濠殿喖鐗撻弻鐔碱敍濞戞瑯妫冩繝娈垮枓閸嬫捇姊洪崘鍙夋儓闁稿﹥鍔曢埞鎴犫偓锝庡亐閹峰姊虹粙鎸庢拱闁煎綊绠栭崺鈧い鎺嶇劍閸婃劗鈧娲橀崝娆撶嵁閺嶃劍濯撮柣鐔碱暒濡叉劙姊绘笟鈧褔鈥﹂崼銉ョ？婵炲棗绻嗗Σ鍫ユ煏韫囨洖顫嶇憸宥夆€︾捄銊﹀磯闁绘碍娼欐慨娑㈡⒑缂佹ɑ灏伴柛銊ユ健楠炲啫螖閸涱垰绁﹂梺鍓茬厛閸犳牗鎱ㄦ惔鈽嗘富闁靛牆绻掗悾铏繆椤愩垹顏柛娆忔噹椤啴濡堕崱娆忊拡闂佺顑囬崑銈夊箖?            if not first_token_sent:
-                update_task_stream(task_id, "", 'processing', truncate_result_delta(full_result), sync=True)
+                update_task_stream(task_id, "", 'processing', truncate_result_delta(full_result), sync=True, first_token_ms=first_token_ms)
                 first_token_sent = True
                 last_update_time = time.time()
                 pending_delta = ""
@@ -1983,7 +2085,7 @@ def run_inference_stream(task: dict, task_id: str, attempt: int = 0):
         except Exception as e:
             log(f"WARN non-stream fallback failed for task {task_id[:8]}: {e}")
 
-    return full_result, token_count
+    return full_result, token_count, first_token_ms
 
 
 def get_task_flag_str(task: dict) -> str:
@@ -2116,12 +2218,13 @@ def inference_worker_loop(worker_index: int):
 
             log(f"闂傚倸鍊搁崐鎼佸磹瀹勬噴褰掑炊瑜夐弸宥夋煛閸モ晛袥闁稿鎸剧划顓炩槈濡顦╅梺绋款儜缁绘繂顕ｉ崼鏇為唶婵﹩鍘介悵鏍磽?闂傚倸鍊搁崐鎼佸磹瀹勬噴褰掑炊椤掑﹦绋忔繝銏ｆ硾椤戝洭銆呴幓鎹楀綊鎮╁顔煎壈缂備讲鍋撳鑸靛姇缁犺绻涢敐搴″濠德ゅ亹缁辨帡鎮╁畷鍥р吂闂佸疇顫夐崹鍧楀箖閳哄懎绠甸柟鐑樼箑缁辨垶绻濈喊妯活潑闁稿甯″畷褰掑醇閺囩偟鐣洪悷婊呭鐢帞绮婚幒妤佺厵闁绘垶锚閻忋儵宕鐐粹拻?{worker_index} 闂傚倸鍊峰ù鍥敋瑜忛埀顒佺▓閺呯娀銆佸▎鎾冲唨妞ゆ挾鍋熼悰銉╂⒑閸︻厼鍔嬫い銊ユ噽婢规洘绻濆顓犲幍闂佺粯鍔﹂崜姘舵倶闁秵鐓涢柍褜鍓熼幊鐐哄Ψ閿濆嫮鐩庨梻浣告惈閸燁偊宕愰悽绋跨闁跨喓濮甸悡鏇㈠箹鏉堝墽绡€闁告瑥瀚伴弻鈥崇暆閳ь剟宕伴弽顓熷仒妞ゆ洍鍋撶€规洖缍婇、娆撳矗閵壯咁槱闂?{task_id[:8]} | {get_pipeline_snapshot()}")
 
-            result_text, token_count = run_inference_with_retry(task, task_id)
+            result_text, token_count, first_token_ms = run_inference_with_retry(task, task_id)
             completion_queue.put({
                 "task_id": task_id,
                 "success": True,
                 "result_text": result_text,
                 "token_count": token_count,
+                "first_token_ms": first_token_ms,
                 "elapsed_seconds": time.time() - start_time,
                 "task": task,
             })
@@ -2147,6 +2250,7 @@ def submit_loop():
             if completion["success"]:
                 result_text = completion["result_text"]
                 token_count = completion["token_count"]
+                first_token_ms = completion.get("first_token_ms")
                 task_meta = completion.get("task") if isinstance(completion.get("task"), dict) else {}
                 result_text = normalize_model_output(result_text, bool(task_meta.get("deep_think", False)))
 
@@ -2162,7 +2266,8 @@ def submit_loop():
                     "id": task_id,
                     "result": result_text,
                     "hash": result_hash,
-                    "token_count": token_count
+                    "token_count": token_count,
+                    "first_token_ms": first_token_ms,
                 })
 
                 if confirm and confirm.get("status") == "success":

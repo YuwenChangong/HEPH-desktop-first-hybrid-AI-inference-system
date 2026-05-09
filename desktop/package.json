@@ -97,6 +97,7 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": true,
       "multiLanguageInstaller": true,
       "displayLanguageSelector": false,
       "installerIcon": "build/heph-logo.ico",
